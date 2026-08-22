@@ -1,5 +1,5 @@
 """
-Phase 1 — ดึงโปรแกรมบอล "วันพรุ่งนี้" จาก API-Football (ผ่าน RapidAPI) แล้วแสดงผลอ่านง่าย
+Phase 1 — ดึงโปรแกรมบอล "วันพรุ่งนี้" จาก API-Football (API-SPORTS โดยตรง) แล้วแสดงผลอ่านง่าย
 
 วิธีใช้:
     pip install -r requirements.txt
@@ -19,8 +19,7 @@ try:
 except ImportError:  # pragma: no cover - รองรับ Python เก่ากว่า 3.9
     ZoneInfo = None
 
-BASE_URL = "https://api-football-v1.p.rapidapi.com/v3"
-RAPIDAPI_HOST = "api-football-v1.p.rapidapi.com"
+BASE_URL = "https://v3.football.api-sports.io"
 TIMEZONE_NAME = "Asia/Bangkok"
 REQUEST_TIMEOUT = 20  # วินาที
 
@@ -62,8 +61,7 @@ def fetch_fixtures(api_key, date_str):
     """เรียก /fixtures แล้วคืน list ของ fixture — จัดการ error ทุกกรณี ไม่ crash เงียบ"""
     url = f"{BASE_URL}/fixtures"
     headers = {
-        "x-rapidapi-key": api_key,
-        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-apisports-key": api_key,
     }
     params = {
         "date": date_str,
@@ -86,12 +84,12 @@ def fetch_fixtures(api_key, date_str):
 
     if status == 429:
         print("[ERROR] โดน rate limit (HTTP 429): เรียก API ถี่เกินไปหรือใช้โควตาของแพลนหมดแล้ว")
-        print("        วิธีแก้: รอให้โควตารีเซ็ต (ปกติรายวัน/รายนาที) หรืออัปเกรดแพลนบน RapidAPI")
+        print("        วิธีแก้: รอให้โควตารีเซ็ต (ปกติรายวัน/รายนาที) หรืออัปเกรดแพลนบน API-SPORTS")
         sys.exit(1)
 
     if status in (401, 403):
-        print(f"[ERROR] ยืนยันตัวตนไม่ผ่าน (HTTP {status}): API key ผิด หรือยังไม่ได้ subscribe API-Football บน RapidAPI")
-        print("        วิธีแก้: ตรวจค่า API_FOOTBALL_KEY ใน .env และเช็คว่า subscribe แพลนแล้ว")
+        print(f"[ERROR] ยืนยันตัวตนไม่ผ่าน (HTTP {status}): API key ผิด หรือบัญชียังไม่ได้ subscribe แพลนบน API-SPORTS")
+        print("        วิธีแก้: ตรวจค่า API_FOOTBALL_KEY ใน .env และเช็คสถานะแพลนที่ dashboard.api-football.com")
         sys.exit(1)
 
     if status != 200:
@@ -106,14 +104,30 @@ def fetch_fixtures(api_key, date_str):
         print(f"        รายละเอียด: {response.text[:500]}")
         sys.exit(1)
 
-    # API-Football บางกรณีตอบ HTTP 200 แต่แจ้ง error ไว้ในฟิลด์ errors
+    # API-SPORTS มักตอบ HTTP 200 แต่แจ้งข้อผิดพลาดไว้ในฟิลด์ errors
+    # เช่น key ผิด/หมดอายุ -> {"errors": {"token": "..."}}
+    #      โควตาหมด        -> {"errors": {"requests": "..."}}
     errors = data.get("errors")
     if errors:
-        print("[ERROR] API แจ้งข้อผิดพลาดกลับมา:")
         if isinstance(errors, dict):
+            if "token" in errors:
+                print("[ERROR] API key ไม่ถูกต้อง (API-SPORTS ตอบ HTTP 200 พร้อม errors.token):")
+                print(f"        {errors['token']}")
+                print("        วิธีแก้: ตรวจค่า API_FOOTBALL_KEY ใน .env ว่าเป็นคีย์จาก dashboard.api-football.com")
+                print("        (คีย์ของ RapidAPI ใช้กับ endpoint นี้ไม่ได้) และเช็คว่าบัญชี subscribe แพลนแล้ว")
+                sys.exit(1)
+
+            if "requests" in errors:
+                print("[ERROR] ใช้โควตาเรียก API หมดแล้ว (errors.requests):")
+                print(f"        {errors['requests']}")
+                print("        วิธีแก้: รอให้โควตารีเซ็ต หรืออัปเกรดแพลนบน API-SPORTS")
+                sys.exit(1)
+
+            print("[ERROR] API แจ้งข้อผิดพลาดกลับมา:")
             for key, message in errors.items():
                 print(f"        - {key}: {message}")
         else:
+            print("[ERROR] API แจ้งข้อผิดพลาดกลับมา:")
             print(f"        - {errors}")
         sys.exit(1)
 
