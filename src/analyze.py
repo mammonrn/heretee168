@@ -30,7 +30,10 @@ from match_data import CountingClient, collect_match_data
 
 # โมเดลที่ใช้วิเคราะห์ — แก้ตรงนี้จุดเดียวถ้าจะเปลี่ยนรุ่น
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 500  # บทวิเคราะห์สั้น 5-6 บรรทัด
+# บทวิเคราะห์สั้น 5-6 บรรทัด แต่ภาษาไทยกิน token มาก จึงเผื่อเพดานไว้กันข้อความถูกตัดกลางคัน
+MAX_TOKENS = 1024
+
+TRUNCATED_NOTE = "(หมายเหตุ: บทวิเคราะห์อาจถูกตัด เพราะยาวเกินเพดาน)"
 
 # path อ้างอิงจากตำแหน่งไฟล์ .py แบบเดียวกับ leagues.json — รันจากที่ไหนก็เจอ
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "analyst_prompt.txt"
@@ -109,7 +112,9 @@ def get_anthropic_key():
 
 
 def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
-    """ส่งข้อมูลคู่บอลเข้า Claude แล้วคืนบทวิเคราะห์เป็นข้อความ"""
+    """
+    ส่งข้อมูลคู่บอลเข้า Claude แล้วคืน (บทวิเคราะห์, ถูกตัดเพราะชนเพดานหรือไม่)
+    """
     client = anthropic.Anthropic(api_key=api_key)
     match_json = json.dumps(match_summary, ensure_ascii=False, indent=2)
 
@@ -161,7 +166,7 @@ def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
     if not text:
         fail("[ERROR] Claude ตอบกลับมาแต่ไม่มีข้อความ — ลองใหม่อีกครั้ง")
 
-    return text
+    return text, response.stop_reason == "max_tokens"
 
 
 def main():
@@ -191,15 +196,19 @@ def main():
 
     match_name = (match_summary.get("match") or {}).get("name") or f"fixture {fixture_id}"
     print(f"กำลังให้เฮียตี๋วิเคราะห์ {match_name} ด้วย {MODEL} ...")
-    analysis = analyze_match(match_summary, anthropic_key, system_prompt)
+    analysis, truncated = analyze_match(match_summary, anthropic_key, system_prompt)
 
     created_at = cache_db.save_analysis(fixture_id, match_name, analysis, MODEL)
 
-    print_analysis(
-        analysis,
+    footer = (
         f"(วิเคราะห์ใหม่ + เก็บลงแคชแล้ว เมื่อ {created_at}) "
-        f"| ยิง API-SPORTS {client.request_count} ครั้ง + Claude 1 ครั้ง",
+        f"| ยิง API-SPORTS {client.request_count} ครั้ง + Claude 1 ครั้ง"
     )
+    if truncated:
+        # ชน max_tokens แปลว่าข้อความถูกตัดกลางคัน ต้องรู้ทันที ไม่ปล่อยผ่านเงียบ ๆ
+        footer += f"\n{TRUNCATED_NOTE}"
+
+    print_analysis(analysis, footer)
 
 
 if __name__ == "__main__":
