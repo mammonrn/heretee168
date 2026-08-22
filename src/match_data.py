@@ -7,14 +7,17 @@ Phase 3B — ดึงข้อมูลเชิงลึกของคู่�
 วิธีใช้:
     python3 src/match_data.py 1234567
 
-ยิง API 5 ครั้งต่อหนึ่งคู่:
+ยิง API 7 ครั้งต่อหนึ่งคู่:
     1) /fixtures?id=...                      รายละเอียดคู่ (ต้องดึงก่อนเพื่อเอา team id / league / season)
     2) /teams/statistics  ทีมเหย้า
     3) /teams/statistics  ทีมเยือน
-    4) /fixtures/headtohead?h2h=A-B&last=5   ห้านัดหลังสุดที่เจอกัน
-    5) /standings                            อันดับในตาราง (เก็บเฉพาะสองทีมนี้)
+    4) /fixtures?team=<home>&last=10         ผลจริง 10 นัดล่าสุดของทีมเหย้า
+    5) /fixtures?team=<away>&last=10         ผลจริง 10 นัดล่าสุดของทีมเยือน
+    6) /fixtures/headtohead?h2h=A-B&last=5   ห้านัดหลังสุดที่เจอกัน
+    7) /standings                            อันดับในตาราง (เก็บเฉพาะสองทีมนี้)
 
-ฟอร์ม 5 นัดล่าสุด (เช่น "WWDLW") ติดมากับ /teams/statistics อยู่แล้ว จึงไม่ต้องยิงแยก
+ฟอร์มจาก /teams/statistics (เช่น "WWDLW") จะว่างช่วงต้นฤดูกาล จึงดึงผลจริง 10 นัดล่าสุด
+มาคำนวณฟอร์มเองด้วย ทีมที่เพิ่งเลื่อนชั้น/ย้ายลีกก็ยังมีข้อมูลให้วิเคราะห์
 """
 
 import json
@@ -23,6 +26,10 @@ import sys
 from api_football import TIMEZONE_NAME, api_get, fail, get_api_key
 
 H2H_LAST = 5
+RECENT_LAST = 10
+
+# status.short ที่ถือว่า "แข่งจบแล้ว" — FT ปกติ, AET ต่อเวลา, PEN ดวลจุดโทษ
+FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 
 def parse_args(argv):
@@ -128,6 +135,83 @@ def summarize_team_stats(response):
     }
 
 
+def match_outcome(item, team_id):
+    """
+    คิดผล W/D/L จากมุมของทีมที่เราสนใจ (ไม่ใช่มุมเจ้าบ้านเสมอ)
+    คืน None ถ้าข้อมูลไม่พอ (ไม่มีสกอร์ / ไม่รู้ว่าทีมเราอยู่ฝั่งไหน)
+    """
+    home_id = dig(item, "teams", "home", "id")
+    away_id = dig(item, "teams", "away", "id")
+    home_goals = to_number(dig(item, "goals", "home"))
+    away_goals = to_number(dig(item, "goals", "away"))
+
+    if home_goals is None or away_goals is None:
+        return None
+
+    if team_id == home_id:
+        side, goals_for, goals_against = "H", home_goals, away_goals
+        opponent = dig(item, "teams", "away", "name")
+    elif team_id == away_id:
+        side, goals_for, goals_against = "A", away_goals, home_goals
+        opponent = dig(item, "teams", "home", "name")
+    else:
+        return None
+
+    if goals_for > goals_against:
+        result = "W"
+    elif goals_for == goals_against:
+        result = "D"
+    else:
+        result = "L"
+
+    return {
+        "date": (dig(item, "fixture", "date") or "")[:10] or None,
+        "opponent": opponent,
+        "home_or_away": side,
+        "score": f"{goals_for}-{goals_against}",  # ของทีมเราก่อนเสมอ
+        "goals_for": goals_for,
+        "goals_against": goals_against,
+        "result": result,
+    }
+
+
+def summarize_recent(response, team_id, limit=RECENT_LAST):
+    """
+    กลั่นผล /fixtures?team=..&last=.. เหลือเฉพาะนัดที่แข่งจบแล้ว
+    คืน {"results": [ใหม่ -> เก่า], "summary": {...} หรือ None ถ้าไม่มีนัดจบเลย}
+    """
+    played = []
+
+    for item in response or []:
+        if dig(item, "fixture", "status", "short") not in FINISHED_STATUSES:
+            continue  # ข้ามนัดที่ยังไม่แข่ง / เลื่อน / ยกเลิก ที่อาจปนมาใน last=N
+        outcome = match_outcome(item, team_id)
+        if outcome is not None:
+            played.append(outcome)
+
+    # เรียงใหม่ -> เก่า (นัดที่ไม่มีวันที่ให้ไปท้ายสุด)
+    played.sort(key=lambda match: match["date"] or "", reverse=True)
+    played = played[:limit]
+
+    if not played:
+        return {"results": [], "summary": None}
+
+    results = [match["result"] for match in played]
+    return {
+        "results": played,
+        "summary": {
+            "played": len(played),
+            "wins": results.count("W"),
+            "draws": results.count("D"),
+            "loses": results.count("L"),
+            "goals_for": sum(match["goals_for"] for match in played),
+            "goals_against": sum(match["goals_against"] for match in played),
+            # เรียงเก่า -> ใหม่ เหมือนฟิลด์ form ของ API-SPORTS
+            "form_string": "".join(reversed(results)),
+        },
+    }
+
+
 def find_standing(response, team_id):
     """หาแถวตารางคะแนนของทีมที่ต้องการจากผล /standings — ไม่เจอคืน None"""
     if not response or team_id is None:
@@ -182,7 +266,8 @@ def summarize_h2h(response, limit=H2H_LAST):
     return matches
 
 
-def build_summary(info, home_stats, away_stats, standings_response, h2h_response):
+def build_summary(info, home_stats, away_stats, home_recent, away_recent,
+                  standings_response, h2h_response):
     """ประกอบ dict สรุปทั้งคู่ พร้อมบันทึกไว้ใน notes ว่าส่วนไหนไม่มีข้อมูล"""
     notes = []
 
@@ -194,6 +279,12 @@ def build_summary(info, home_stats, away_stats, standings_response, h2h_response
         if all(value is None for value in summary.values()):
             notes.append(f"ไม่มีสถิติของ{label} ({side['name']}) ในลีก/ฤดูกาลนี้")
         side.update(summary)
+
+    for side, label, raw in ((home, "ทีมเหย้า", home_recent), (away, "ทีมเยือน", away_recent)):
+        recent = summarize_recent(raw, side["team_id"])
+        if recent["summary"] is None:
+            notes.append(f"ไม่มีนัดที่แข่งจบใน {RECENT_LAST} นัดล่าสุดของ{label} ({side['name']})")
+        side["recent"] = recent
 
     for side, label in ((home, "ทีมเหย้า"), (away, "ทีมเยือน")):
         standing = find_standing(standings_response, side["team_id"])
@@ -256,6 +347,18 @@ def collect_match_data(client, fixture_id):
     home_stats = team_stats(info["home_id"], info["home_name"])
     away_stats = team_stats(info["away_id"], info["away_name"])
 
+    def recent_fixtures(team_id, team_name):
+        if team_id is None:
+            return []
+        return client.get(
+            "fixtures",
+            {"team": team_id, "last": RECENT_LAST, "timezone": TIMEZONE_NAME},
+            label=f"({team_name} ย้อนหลัง {RECENT_LAST} นัด)",
+        )
+
+    home_recent = recent_fixtures(info["home_id"], info["home_name"])
+    away_recent = recent_fixtures(info["away_id"], info["away_name"])
+
     h2h_response = []
     if info["home_id"] is not None and info["away_id"] is not None:
         h2h_response = client.get(
@@ -272,7 +375,10 @@ def collect_match_data(client, fixture_id):
             label=f"(league={league_id}, season={season})",
         )
 
-    return build_summary(info, home_stats, away_stats, standings_response, h2h_response)
+    return build_summary(
+        info, home_stats, away_stats, home_recent, away_recent,
+        standings_response, h2h_response,
+    )
 
 
 def main():
