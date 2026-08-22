@@ -5,6 +5,11 @@ flow: /start -> เลือกวัน -> เลือกลีก -> เล�
 ตอบเฉพาะปุ่มเท่านั้น ข้อความอิสระของผู้ใช้จะไม่ถูกส่งเข้า AI เด็ดขาด
 ใช้ได้เฉพาะสมาชิกกลุ่ม (ถ้าตั้ง GROUP_CHAT_ID ไว้) และมี /postgroup ให้แอดมินโพสต์ปุ่มลงกลุ่ม
 
+บอทโต้ตอบเฉพาะ "แชทส่วนตัว" เท่านั้น ในกลุ่มจะเงียบสนิท (กลุ่มเป็นแค่หน้าร้านที่มีปุ่มปักหมุด)
+แนะนำให้ตั้ง Privacy Mode ของบอทเป็น ENABLED ด้วย: คุยกับ @BotFather -> /setprivacy -> Enable
+บอทจะได้ไม่เห็นข้อความทั่วไปในกลุ่มตั้งแต่แรก ลดภาระและปลอดภัยกว่า
+แต่โค้ดกันเองอยู่แล้ว (ดู private_only) ไม่ได้พึ่งการตั้งค่านั้นอย่างเดียว
+
 วิธีใช้:
     pip install -r requirements.txt
     # ใส่ TELEGRAM_BOT_TOKEN ลงใน .env (ขอจาก @BotFather)
@@ -16,10 +21,11 @@ import logging
 import os
 import sys
 import time
+from functools import wraps
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -384,6 +390,28 @@ async def safe_edit(query, text, reply_markup):
 # ---------- handlers ----------
 
 
+def private_only(handler):
+    """
+    ครอบ handler ให้รับเฉพาะแชทส่วนตัว
+    update จากกลุ่ม / ซูเปอร์กลุ่ม / แชนแนล (รวมถึงการกดปุ่มที่ค้างอยู่ในกลุ่ม) จะถูกเพิกเฉยเงียบ ๆ
+    ไม่ตอบ ไม่โชว์เมนู ไม่เรียก AI — กลุ่มเป็นแค่หน้าร้านที่มีปุ่ม deep link ปักหมุดไว้
+    """
+
+    @wraps(handler)
+    async def wrapper(update, context):
+        chat = getattr(update, "effective_chat", None)
+        chat_type = getattr(chat, "type", None)
+
+        if chat_type != ChatType.PRIVATE:
+            logger.info("เพิกเฉย update จาก chat type=%s (บอทตอบเฉพาะแชทส่วนตัว)", chat_type)
+            return
+
+        return await handler(update, context)
+
+    return wrapper
+
+
+@private_only
 async def start_handler(update, context):
     """/start — รองรับ deep link payload (/start <payload>) โดยยังไม่ทำ logic พิเศษ"""
     payload = context.args[0] if getattr(context, "args", None) else None
@@ -400,6 +428,7 @@ async def start_handler(update, context):
     await show_days(update.message, context)
 
 
+@private_only
 async def day_handler(update, context):
     """กดปุ่มวัน -> โชว์ลีกของวันนั้น"""
     query = update.callback_query
@@ -417,6 +446,7 @@ async def day_handler(update, context):
                     league_keyboard(snapshot, date_str))
 
 
+@private_only
 async def league_handler(update, context):
     """กดปุ่มลีก -> โชว์คู่บอลในลีกนั้น"""
     query = update.callback_query
@@ -439,6 +469,7 @@ async def league_handler(update, context):
     )
 
 
+@private_only
 async def match_handler(update, context):
     """กดปุ่มคู่บอล -> วิเคราะห์ (จุดเดียวที่เรียก AI)"""
     query = update.callback_query
@@ -478,6 +509,7 @@ async def match_handler(update, context):
     await safe_edit(query, result["analysis"], after_analysis_keyboard(date_str, league_id))
 
 
+@private_only
 async def back_handler(update, context):
     """ปุ่มย้อนกลับทุกระดับ: back:days / back:leagues:<date> / back:matches:<date>:<league_id>"""
     query = update.callback_query
@@ -514,6 +546,7 @@ async def back_handler(update, context):
         )
 
 
+# ไม่ครอบ private_only: จำกัดด้วย ADMIN_USER_ID อยู่แล้ว และแอดมินอาจสั่งจากที่ไหนก็ได้
 async def postgroup_handler(update, context):
     """/postgroup — แอดมินสั่งให้บอทโพสต์ปุ่ม deep link ลงกลุ่ม (ใช้ครั้งเดียวตอนตั้งระบบ)"""
     user = update.effective_user
@@ -556,6 +589,7 @@ async def postgroup_handler(update, context):
     await update.message.reply_text(POSTGROUP_PINNED)
 
 
+@private_only
 async def text_fallback_handler(update, context):
     """
     ข้อความอิสระ: ตอบด้วยเมนูเท่านั้น
