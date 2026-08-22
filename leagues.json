@@ -1,0 +1,11 @@
+[
+  { "id": 39,  "name_en": "Premier League",        "name_th": "พรีเมียร์ลีก",        "priority": 1 },
+  { "id": 140, "name_en": "La Liga",               "name_th": "ลาลีกา",              "priority": 2 },
+  { "id": 78,  "name_en": "Bundesliga",            "name_th": "บุนเดสลีกา",          "priority": 3 },
+  { "id": 135, "name_en": "Serie A",               "name_th": "กัลโช่ เซเรีย อา",    "priority": 4 },
+  { "id": 61,  "name_en": "Ligue 1",               "name_th": "ลีกเอิง",             "priority": 5 },
+  { "id": 2,   "name_en": "UEFA Champions League", "name_th": "ยูฟ่า แชมเปียนส์ลีก", "priority": 6 },
+  { "id": 3,   "name_en": "UEFA Europa League",    "name_th": "ยูฟ่า ยูโรปาลีก",     "priority": 7 },
+  { "id": 24,  "name_en": "ASEAN Championship",    "name_th": "อาเซียนแชมเปียนชิพ",  "priority": 8 },
+  { "id": 296, "name_en": "Thai League 1",         "name_th": "ไทยลีก",              "priority": 9 }
+]
