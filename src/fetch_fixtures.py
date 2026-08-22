@@ -1,5 +1,6 @@
 """
 Phase 1 — ดึงโปรแกรมบอล 3 วัน (วันนี้ + พรุ่งนี้ + มะรืน) จาก API-Football (API-SPORTS โดยตรง)
+ยิงทีละวันด้วย param date (API-SPORTS ไม่รองรับ from/to ถ้าไม่ระบุ league + season)
 แล้วกรองเฉพาะลีกที่กำหนดไว้ใน leagues.json ก่อนแสดงผล
 
 วิธีใช้:
@@ -106,16 +107,39 @@ def day_label(date_str, dates):
     return date_str
 
 
-def fetch_fixtures(api_key, date_from, date_to):
+def fetch_fixtures(api_key, dates):
     """
-    เรียก /fixtures ครั้งเดียวด้วย date range (from/to) เพื่อประหยัดโควตา
-    error ทุกกรณีถูกจัดการใน api_get
+    ยิง /fixtures ทีละวันตามรายการ dates แล้วรวมผลเป็น list เดียว
+    (API-SPORTS ไม่รองรับ from/to ถ้าไม่ระบุ league + season จึงต้องวนยิงทีละวัน)
+
+    ถ้าวันไหนพัง api_get จะพิมพ์สาเหตุแล้วจบโปรแกรม — ตรงนี้เสริมว่าพังที่วันไหน
+    เพื่อให้รู้ว่าข้อมูลไม่ครบ ไม่ใช่เงียบ ๆ ข้ามวันนั้นไป
     """
-    return api_get("fixtures", api_key, {
-        "from": date_from,
-        "to": date_to,
-        "timezone": TIMEZONE_NAME,
-    })
+    all_fixtures = []
+    seen_ids = set()
+
+    for index, date_str in enumerate(dates, start=1):
+        print(f"  - ยิง API ครั้งที่ {index}/{len(dates)}: date={date_str}")
+        try:
+            day_fixtures = api_get("fixtures", api_key, {
+                "date": date_str,
+                "timezone": TIMEZONE_NAME,
+            })
+        except SystemExit:
+            print(f"[ERROR] ดึงข้อมูลล้มเหลวที่วันที่ {date_str} (ครั้งที่ {index} จาก {len(dates)})")
+            print(f"        หยุดทำงานทันที เพราะข้อมูลจะไม่ครบทั้ง {len(dates)} วัน")
+            raise
+
+        for item in day_fixtures:
+            # กันซ้ำเผื่อคู่เดียวกันถูกส่งกลับมาในคำขอของสองวันติดกัน
+            fixture_id = (item.get("fixture") or {}).get("id")
+            if fixture_id is not None:
+                if fixture_id in seen_ids:
+                    continue
+                seen_ids.add(fixture_id)
+            all_fixtures.append(item)
+
+    return all_fixtures
 
 
 def kickoff_parts(fixture_date, tz):
@@ -171,7 +195,7 @@ def group_by_day_and_league(fixtures, leagues, tz):
     return days
 
 
-def print_fixtures(days, total_count, dates):
+def print_fixtures(days, total_count, dates, request_count):
     """แสดงผลแยกตามวัน → ลีก (วันที่ไม่มีคู่ในลีกที่ติดตามจะถูกข้ามไปเลย)"""
     print(f"โปรแกรมบอล {len(dates)} วัน ({dates[0]} ถึง {dates[-1]}) เวลาไทย — {TIMEZONE_NAME}")
     print("=" * 70)
@@ -188,7 +212,7 @@ def print_fixtures(days, total_count, dates):
         else:
             print("ยังไม่มีโปรแกรมแข่งขันในช่วงวันดังกล่าว (หรือ API ยังไม่อัปเดตข้อมูล)")
         print("=" * 70)
-        print(f"แสดง {shown_count} คู่ ({len(dates)} วัน) จากทั้งหมด {total_count} คู่")
+        print(summary_line(shown_count, total_count, len(dates), request_count))
         return
 
     for date_str, league_groups in days:
@@ -203,7 +227,15 @@ def print_fixtures(days, total_count, dates):
 
     print()
     print("=" * 70)
-    print(f"แสดง {shown_count} คู่ ({len(dates)} วัน) จากทั้งหมด {total_count} คู่")
+    print(summary_line(shown_count, total_count, len(dates), request_count))
+
+
+def summary_line(shown_count, total_count, day_count, request_count):
+    """บรรทัดสรุปท้าย เช่น 'แสดง 14 คู่ (3 วัน, ยิง API 3 ครั้ง) จากทั้งหมด 818 คู่'"""
+    return (
+        f"แสดง {shown_count} คู่ ({day_count} วัน, ยิง API {request_count} ครั้ง) "
+        f"จากทั้งหมด {total_count} คู่"
+    )
 
 
 def main():
@@ -213,8 +245,13 @@ def main():
     dates = date_range(tz)
 
     print(f"กำลังดึงข้อมูลโปรแกรมบอลวันที่ {dates[0]} ถึง {dates[-1]} ...")
-    fixtures = fetch_fixtures(api_key, dates[0], dates[-1])
-    print_fixtures(group_by_day_and_league(fixtures, leagues, tz), len(fixtures), dates)
+    fixtures = fetch_fixtures(api_key, dates)
+    print_fixtures(
+        group_by_day_and_league(fixtures, leagues, tz),
+        len(fixtures),
+        dates,
+        len(dates),
+    )
 
 
 if __name__ == "__main__":
