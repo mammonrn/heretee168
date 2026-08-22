@@ -167,7 +167,7 @@ def kickoff_parts(fixture_date, tz):
 def group_by_day_and_league(fixtures, leagues, tz):
     """
     เก็บเฉพาะคู่ที่ league id อยู่ใน config แล้วจัดกลุ่มเป็น วัน → ลีก
-    คืน list ของ (วันที่, [(ข้อมูลลีก, [(เวลาเตะ, ทีมเหย้า, ทีมเยือน), ...]), ...])
+    คืน list ของ (วันที่, [(ข้อมูลลีก, [(เวลาเตะ, ทีมเหย้า, ทีมเยือน, fixture_id), ...]), ...])
     วันเรียงจากเก่าไปใหม่, ลีกเรียงตาม priority, คู่บอลเรียงตามเวลาเตะ
     """
     grouped = {}
@@ -184,6 +184,7 @@ def group_by_day_and_league(fixtures, leagues, tz):
             kickoff,
             (teams.get("home") or {}).get("name") or "ทีมเหย้า ?",
             (teams.get("away") or {}).get("name") or "ทีมเยือน ?",
+            (item.get("fixture") or {}).get("id"),  # เอาไปใช้กับ match_data.py ต่อได้เลย
         ))
 
     days = []
@@ -225,8 +226,9 @@ def print_fixtures(days, total_count, dates, request_count):
             print()
             print(f"[{league['name_th']}] ({league['name_en']})")
             print("-" * 70)
-            for kickoff, home, away in matches:
-                print(f"  {kickoff}  {home} vs {away}")
+            for kickoff, home, away, fixture_id in matches:
+                suffix = f"  [id: {fixture_id}]" if fixture_id is not None else ""
+                print(f"  {kickoff}  {home} vs {away}{suffix}")
 
     print()
     print("=" * 70)
