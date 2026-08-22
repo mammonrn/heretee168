@@ -1,12 +1,15 @@
 """
 Phase 3C — วิเคราะห์คู่บอลด้วย Claude API ในบุคลิก "เฮียตี๋"
 
-ขั้นตอน: ดึงข้อมูลเชิงลึกด้วย match_data.collect_match_data() -> ส่งเข้า Claude -> แสดงบทวิเคราะห์
-(ยังไม่เก็บ cache — นั่นเป็นงานของ Phase 3D)
+ขั้นตอน: เช็คแคชก่อน -> ถ้าไม่มีค่อยดึงข้อมูลด้วย match_data.collect_match_data()
+-> ส่งเข้า Claude -> แสดงบทวิเคราะห์ -> เก็บลงแคช (cache_db.py)
+
+คู่ที่วิเคราะห์แล้วจะไม่ถูกวิเคราะห์ซ้ำ ประหยัดทั้งโควตา API-SPORTS และค่า Claude
 
 วิธีใช้:
     pip install -r requirements.txt
     python3 src/analyze.py 1557375
+    python3 src/analyze.py 1557375 --fresh   # บังคับวิเคราะห์ใหม่ ข้ามแคช (ใช้ตอนจูน prompt)
 
 ต้องมีใน .env:
     API_FOOTBALL_KEY=...     สำหรับดึงข้อมูลบอล (API-SPORTS)
@@ -21,8 +24,9 @@ from pathlib import Path
 import anthropic
 from dotenv import load_dotenv
 
+import cache_db
 from api_football import fail, get_api_key
-from match_data import CountingClient, collect_match_data, parse_args
+from match_data import CountingClient, collect_match_data
 
 # โมเดลที่ใช้วิเคราะห์ — แก้ตรงนี้จุดเดียวถ้าจะเปลี่ยนรุ่น
 MODEL = "claude-sonnet-4-6"
@@ -36,6 +40,39 @@ USER_INSTRUCTION = (
     "แล้วฟันธงว่าทีมไหนได้เปรียบ พร้อมเหตุผลจากข้อมูลจริง\n\n"
     "ข้อมูลคู่บอล (JSON):\n"
 )
+
+
+def parse_args(argv):
+    """รับ fixture_id และ flag --fresh (บังคับวิเคราะห์ใหม่ ข้ามแคช)"""
+    args = list(argv)
+
+    if any(arg in ("-h", "--help") for arg in args):
+        print(__doc__.strip())
+        sys.exit(0)
+
+    fresh = "--fresh" in args
+    args = [arg for arg in args if arg != "--fresh"]
+
+    if len(args) != 1:
+        fail(
+            "[ERROR] ต้องระบุ fixture_id หนึ่งค่า",
+            "ตัวอย่าง: python3 src/analyze.py 1557375",
+            "เพิ่ม --fresh ถ้าต้องการวิเคราะห์ใหม่โดยไม่ใช้แคช",
+        )
+
+    try:
+        return int(args[0]), fresh
+    except ValueError:
+        fail(f"[ERROR] fixture_id ต้องเป็นตัวเลข แต่ได้รับ: {args[0]!r}")
+
+
+def print_analysis(analysis, footer):
+    """แสดงบทวิเคราะห์พร้อมบรรทัดบอกที่มา"""
+    print()
+    print("=" * 70)
+    print(analysis)
+    print("=" * 70)
+    print(footer)
 
 
 def load_system_prompt(prompt_path=PROMPT_PATH):
@@ -128,7 +165,22 @@ def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
 
 
 def main():
-    fixture_id = parse_args(sys.argv[1:])
+    fixture_id, fresh = parse_args(sys.argv[1:])
+    cache_db.init_db()
+
+    if fresh:
+        print("โหมด --fresh: ข้ามแคช วิเคราะห์ใหม่แล้วเขียนทับของเดิม")
+    else:
+        cached = cache_db.get_analysis(fixture_id)
+        if cached:
+            print(f"เจอในแคช: {cached['match_name']}")
+            print_analysis(
+                cached["analysis_text"],
+                f"(จากแคช — วิเคราะห์เมื่อ {cached['created_at']} ด้วย {cached['model_used']}) "
+                f"| ยิง API 0 ครั้ง",
+            )
+            return
+
     system_prompt = load_system_prompt()
     anthropic_key = get_anthropic_key()
 
@@ -141,10 +193,13 @@ def main():
     print(f"กำลังให้เฮียตี๋วิเคราะห์ {match_name} ด้วย {MODEL} ...")
     analysis = analyze_match(match_summary, anthropic_key, system_prompt)
 
-    print()
-    print("=" * 70)
-    print(analysis)
-    print("=" * 70)
+    created_at = cache_db.save_analysis(fixture_id, match_name, analysis, MODEL)
+
+    print_analysis(
+        analysis,
+        f"(วิเคราะห์ใหม่ + เก็บลงแคชแล้ว เมื่อ {created_at}) "
+        f"| ยิง API-SPORTS {client.request_count} ครั้ง + Claude 1 ครั้ง",
+    )
 
 
 if __name__ == "__main__":
