@@ -169,46 +169,76 @@ def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
     return text, response.stop_reason == "max_tokens"
 
 
-def main():
-    fixture_id, fresh = parse_args(sys.argv[1:])
+def analyze_fixture(fixture_id, fresh=False, log=lambda message: None):
+    """
+    หัวใจของการวิเคราะห์หนึ่งคู่ ใช้ร่วมกันทั้ง CLI และบอท Telegram (ไม่ print เอง)
+
+    เช็คแคชก่อน ถ้าไม่เจอค่อยดึงข้อมูล + เรียก Claude + เก็บลงแคช
+    คืน dict: analysis, match_name, from_cache, created_at, model, sports_requests, truncated
+    ส่ง callable เข้าทาง log ได้ถ้าอยากเห็นความคืบหน้า (CLI ส่ง print, บอทส่ง logger.info)
+    """
     cache_db.init_db()
 
     if fresh:
-        print("โหมด --fresh: ข้ามแคช วิเคราะห์ใหม่แล้วเขียนทับของเดิม")
+        log("โหมด --fresh: ข้ามแคช วิเคราะห์ใหม่แล้วเขียนทับของเดิม")
     else:
         cached = cache_db.get_analysis(fixture_id)
         if cached:
-            print(f"เจอในแคช: {cached['match_name']}")
-            print_analysis(
-                cached["analysis_text"],
-                f"(จากแคช — วิเคราะห์เมื่อ {cached['created_at']} ด้วย {cached['model_used']}) "
-                f"| ยิง API 0 ครั้ง",
-            )
-            return
+            log(f"เจอในแคช: {cached['match_name']}")
+            return {
+                "analysis": cached["analysis_text"],
+                "match_name": cached["match_name"],
+                "from_cache": True,
+                "created_at": cached["created_at"],
+                "model": cached["model_used"],
+                "sports_requests": 0,
+                "truncated": False,
+            }
 
     system_prompt = load_system_prompt()
     anthropic_key = get_anthropic_key()
 
     client = CountingClient(get_api_key())
-    print(f"กำลังดึงข้อมูลเชิงลึกของ fixture_id={fixture_id} ...")
+    log(f"กำลังดึงข้อมูลเชิงลึกของ fixture_id={fixture_id} ...")
     match_summary = collect_match_data(client, fixture_id)
-    print(f"ดึงข้อมูลครบ (ยิง API-SPORTS ไป {client.request_count} ครั้ง)")
+    log(f"ดึงข้อมูลครบ (ยิง API-SPORTS ไป {client.request_count} ครั้ง)")
 
     match_name = (match_summary.get("match") or {}).get("name") or f"fixture {fixture_id}"
-    print(f"กำลังให้เฮียตี๋วิเคราะห์ {match_name} ด้วย {MODEL} ...")
+    log(f"กำลังให้เฮียตี๋วิเคราะห์ {match_name} ด้วย {MODEL} ...")
     analysis, truncated = analyze_match(match_summary, anthropic_key, system_prompt)
 
     created_at = cache_db.save_analysis(fixture_id, match_name, analysis, MODEL)
 
-    footer = (
-        f"(วิเคราะห์ใหม่ + เก็บลงแคชแล้ว เมื่อ {created_at}) "
-        f"| ยิง API-SPORTS {client.request_count} ครั้ง + Claude 1 ครั้ง"
-    )
-    if truncated:
-        # ชน max_tokens แปลว่าข้อความถูกตัดกลางคัน ต้องรู้ทันที ไม่ปล่อยผ่านเงียบ ๆ
-        footer += f"\n{TRUNCATED_NOTE}"
+    return {
+        "analysis": analysis,
+        "match_name": match_name,
+        "from_cache": False,
+        "created_at": created_at,
+        "model": MODEL,
+        "sports_requests": client.request_count,
+        "truncated": truncated,
+    }
 
-    print_analysis(analysis, footer)
+
+def main():
+    fixture_id, fresh = parse_args(sys.argv[1:])
+    result = analyze_fixture(fixture_id, fresh=fresh, log=print)
+
+    if result["from_cache"]:
+        footer = (
+            f"(จากแคช — วิเคราะห์เมื่อ {result['created_at']} ด้วย {result['model']}) "
+            f"| ยิง API 0 ครั้ง"
+        )
+    else:
+        footer = (
+            f"(วิเคราะห์ใหม่ + เก็บลงแคชแล้ว เมื่อ {result['created_at']}) "
+            f"| ยิง API-SPORTS {result['sports_requests']} ครั้ง + Claude 1 ครั้ง"
+        )
+        if result["truncated"]:
+            # ชน max_tokens แปลว่าข้อความถูกตัดกลางคัน ต้องรู้ทันที ไม่ปล่อยผ่านเงียบ ๆ
+            footer += f"\n{TRUNCATED_NOTE}"
+
+    print_analysis(result["analysis"], footer)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ DAY_LABELS = ("วันนี้", "พรุ่งนี้", "มะรืน
 
 def load_leagues(config_path=LEAGUES_CONFIG_PATH):
     """
-    โหลด leagues.json แล้วคืน dict: {league_id: {"name_th", "name_en", "priority"}}
+    โหลด leagues.json แล้วคืน dict: {league_id: {"id", "name_th", "name_en", "priority"}}
     ถ้าไม่พบไฟล์ / JSON เสีย / โครงสร้างผิด → หยุดพร้อมบอกสาเหตุ
     """
     try:
@@ -87,6 +87,7 @@ def load_leagues(config_path=LEAGUES_CONFIG_PATH):
             )
 
         leagues[league_id] = {
+            "id": league_id,
             "name_th": entry["name_th"],
             "name_en": entry["name_en"],
             "priority": priority,
