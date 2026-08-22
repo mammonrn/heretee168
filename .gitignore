@@ -1,6 +1,12 @@
 # Secrets — ห้าม commit เด็ดขาด
 .env
 
+# ฐานข้อมูลแคช — ไม่ควร commit ขึ้น git
+cache.db
+cache.db-journal
+cache.db-wal
+cache.db-shm
+
 # Virtual environment
 venv/
 .venv/
