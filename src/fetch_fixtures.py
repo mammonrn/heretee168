@@ -1,5 +1,5 @@
 """
-Phase 1 — ดึงโปรแกรมบอล 3 วัน (วันนี้ + พรุ่งนี้ + มะรืน) จาก API-Football (API-SPORTS โดยตรง)
+Phase 1 — ดึงโปรแกรมบอล 2 วัน (วันนี้ + พรุ่งนี้) จาก API-Football (API-SPORTS โดยตรง)
 ยิงทีละวันด้วย param date (API-SPORTS ไม่รองรับ from/to ถ้าไม่ระบุ league + season)
 แล้วกรองเฉพาะลีกที่กำหนดไว้ใน leagues.json ก่อนแสดงผล
 
@@ -21,8 +21,11 @@ from api_football import TIMEZONE_NAME, api_get, fail, get_api_key, get_bangkok_
 # อ้างอิงจากตำแหน่งไฟล์ .py ไม่ใช่ working directory — รันจาก path ไหนก็หา config เจอ
 LEAGUES_CONFIG_PATH = Path(__file__).resolve().parent.parent / "leagues.json"
 
-# จำนวนวันที่ดึง นับจากวันนี้ (3 = วันนี้ + พรุ่งนี้ + มะรืน)
-DAYS_AHEAD = 3
+# จำนวนวันที่ดึง นับจากวันนี้ (2 = วันนี้ + พรุ่งนี้)
+# free plan ของ API-SPORTS ให้ดึงโปรแกรมล่วงหน้าได้แค่ ~1 วัน (ช่วง เมื่อวาน–พรุ่งนี้)
+# ขอมะรืนขึ้นไปจะโดน error เรื่องแพลน จึงจำกัดไว้ที่ 2 วัน
+# ถ้าอัปเกรดแพลนแล้วเพิ่มค่านี้ได้เลย ส่วนอื่น (ป้ายวัน / จำนวนครั้งที่ยิง API) คำนวณตามเอง
+DAYS_AHEAD = 2
 
 # ป้ายหัวข้อวัน เรียงตามลำดับวัน (offset 0, 1, 2 ...) ถ้าเกินจากนี้จะใช้วันที่ล้วน
 DAY_LABELS = ("วันนี้", "พรุ่งนี้", "มะรืน")
@@ -231,7 +234,7 @@ def print_fixtures(days, total_count, dates, request_count):
 
 
 def summary_line(shown_count, total_count, day_count, request_count):
-    """บรรทัดสรุปท้าย เช่น 'แสดง 14 คู่ (3 วัน, ยิง API 3 ครั้ง) จากทั้งหมด 818 คู่'"""
+    """บรรทัดสรุปท้าย เช่น 'แสดง 9 คู่ (2 วัน, ยิง API 2 ครั้ง) จากทั้งหมด 540 คู่'"""
     return (
         f"แสดง {shown_count} คู่ ({day_count} วัน, ยิง API {request_count} ครั้ง) "
         f"จากทั้งหมด {total_count} คู่"
