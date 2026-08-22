@@ -1,5 +1,5 @@
 """
-Phase 1 — ดึงโปรแกรมบอล "วันพรุ่งนี้" จาก API-Football (API-SPORTS โดยตรง)
+Phase 1 — ดึงโปรแกรมบอล 3 วัน (วันนี้ + พรุ่งนี้ + มะรืน) จาก API-Football (API-SPORTS โดยตรง)
 แล้วกรองเฉพาะลีกที่กำหนดไว้ใน leagues.json ก่อนแสดงผล
 
 วิธีใช้:
@@ -19,6 +19,12 @@ from api_football import TIMEZONE_NAME, api_get, fail, get_api_key, get_bangkok_
 
 # อ้างอิงจากตำแหน่งไฟล์ .py ไม่ใช่ working directory — รันจาก path ไหนก็หา config เจอ
 LEAGUES_CONFIG_PATH = Path(__file__).resolve().parent.parent / "leagues.json"
+
+# จำนวนวันที่ดึง นับจากวันนี้ (3 = วันนี้ + พรุ่งนี้ + มะรืน)
+DAYS_AHEAD = 3
+
+# ป้ายหัวข้อวัน เรียงตามลำดับวัน (offset 0, 1, 2 ...) ถ้าเกินจากนี้จะใช้วันที่ล้วน
+DAY_LABELS = ("วันนี้", "พรุ่งนี้", "มะรืน")
 
 
 def load_leagues(config_path=LEAGUES_CONFIG_PATH):
@@ -85,31 +91,57 @@ def load_leagues(config_path=LEAGUES_CONFIG_PATH):
     return leagues
 
 
-def tomorrow_date_str(tz):
-    """คำนวณวันพรุ่งนี้ตาม timezone Asia/Bangkok รูปแบบ YYYY-MM-DD"""
-    return (datetime.now(tz) + timedelta(days=1)).strftime("%Y-%m-%d")
+def date_range(tz, days=DAYS_AHEAD):
+    """คืนรายการวันที่ตามเวลาไทย เริ่มจากวันนี้ รูปแบบ YYYY-MM-DD (คำนวณสดทุกครั้ง ไม่ hardcode)"""
+    today = datetime.now(tz).date()
+    return [(today + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days)]
 
 
-def fetch_fixtures(api_key, date_str):
-    """เรียก /fixtures ของวันที่ที่ระบุ (เวลาไทย) — error ทุกกรณีถูกจัดการใน api_get"""
-    return api_get("fixtures", api_key, {"date": date_str, "timezone": TIMEZONE_NAME})
+def day_label(date_str, dates):
+    """ป้ายหัวข้อวัน เช่น 'วันนี้ (2026-08-22)' — วันที่นอกช่วงจะแสดงเฉพาะวันที่"""
+    if date_str in dates:
+        offset = dates.index(date_str)
+        if offset < len(DAY_LABELS):
+            return f"{DAY_LABELS[offset]} ({date_str})"
+    return date_str
 
 
-def format_kickoff(fixture_date):
-    """แปลงเวลาเตะจาก ISO string เป็น HH:MM (เวลาไทยตามที่ขอไปกับ params)"""
-    if not fixture_date:
-        return "??:??"
-    try:
-        return datetime.fromisoformat(fixture_date.replace("Z", "+00:00")).strftime("%H:%M")
-    except ValueError:
-        return str(fixture_date)
-
-
-def group_by_league(fixtures, leagues):
+def fetch_fixtures(api_key, date_from, date_to):
     """
-    เก็บเฉพาะคู่ที่ league id อยู่ใน config แล้วจัดกลุ่มตามลีก
-    คืน list ของ (ข้อมูลลีก, [(เวลาเตะ, ทีมเหย้า, ทีมเยือน), ...])
-    เรียงลีกตาม priority และภายในลีกเรียงตามเวลาเตะ
+    เรียก /fixtures ครั้งเดียวด้วย date range (from/to) เพื่อประหยัดโควตา
+    error ทุกกรณีถูกจัดการใน api_get
+    """
+    return api_get("fixtures", api_key, {
+        "from": date_from,
+        "to": date_to,
+        "timezone": TIMEZONE_NAME,
+    })
+
+
+def kickoff_parts(fixture_date, tz):
+    """
+    แปลงเวลาเตะจาก ISO string เป็น (YYYY-MM-DD, HH:MM) ตามเวลาไทย
+    แปลงเป็น Asia/Bangkok ก่อนเสมอ คู่ที่เตะดึกจึงถูกนับเป็นวันถัดไปให้ถูกต้อง
+    """
+    if not fixture_date:
+        return "ไม่ทราบวันที่", "??:??"
+
+    try:
+        moment = datetime.fromisoformat(fixture_date.replace("Z", "+00:00"))
+    except ValueError:
+        return str(fixture_date)[:10], "??:??"
+
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(tz)
+
+    return moment.strftime("%Y-%m-%d"), moment.strftime("%H:%M")
+
+
+def group_by_day_and_league(fixtures, leagues, tz):
+    """
+    เก็บเฉพาะคู่ที่ league id อยู่ใน config แล้วจัดกลุ่มเป็น วัน → ลีก
+    คืน list ของ (วันที่, [(ข้อมูลลีก, [(เวลาเตะ, ทีมเหย้า, ทีมเยือน), ...]), ...])
+    วันเรียงจากเก่าไปใหม่, ลีกเรียงตาม priority, คู่บอลเรียงตามเวลาเตะ
     """
     grouped = {}
 
@@ -119,56 +151,70 @@ def group_by_league(fixtures, leagues):
             continue
 
         teams = item.get("teams") or {}
-        grouped.setdefault(league_id, []).append((
-            format_kickoff((item.get("fixture") or {}).get("date")),
+        date_str, kickoff = kickoff_parts((item.get("fixture") or {}).get("date"), tz)
+
+        grouped.setdefault(date_str, {}).setdefault(league_id, []).append((
+            kickoff,
             (teams.get("home") or {}).get("name") or "ทีมเหย้า ?",
             (teams.get("away") or {}).get("name") or "ทีมเยือน ?",
         ))
 
-    result = []
-    for league_id in sorted(grouped, key=lambda key: (leagues[key]["priority"], key)):
-        matches = sorted(grouped[league_id], key=lambda match: match[0])
-        result.append((leagues[league_id], matches))
+    days = []
+    for date_str in sorted(grouped):
+        by_league = grouped[date_str]
+        league_groups = [
+            (leagues[league_id], sorted(by_league[league_id], key=lambda match: match[0]))
+            for league_id in sorted(by_league, key=lambda key: (leagues[key]["priority"], key))
+        ]
+        days.append((date_str, league_groups))
 
-    return result
+    return days
 
 
-def print_fixtures(groups, total_count, date_str):
-    """แสดงผลแยกตามลีก ใช้ name_th เป็นหัวข้อ"""
-    print(f"โปรแกรมบอลวันพรุ่งนี้ ({date_str}) เวลาไทย — {TIMEZONE_NAME}")
+def print_fixtures(days, total_count, dates):
+    """แสดงผลแยกตามวัน → ลีก (วันที่ไม่มีคู่ในลีกที่ติดตามจะถูกข้ามไปเลย)"""
+    print(f"โปรแกรมบอล {len(dates)} วัน ({dates[0]} ถึง {dates[-1]}) เวลาไทย — {TIMEZONE_NAME}")
     print("=" * 70)
 
-    shown_count = sum(len(matches) for _, matches in groups)
+    shown_count = sum(
+        len(matches)
+        for _, league_groups in days
+        for _, matches in league_groups
+    )
 
-    if not groups:
+    if not days:
         if total_count:
-            print("วันดังกล่าวไม่มีคู่บอลของลีกที่ติดตามอยู่ใน leagues.json")
+            print(f"ช่วง {len(dates)} วันนี้ไม่มีคู่บอลของลีกที่ติดตามอยู่ใน leagues.json")
         else:
-            print("ยังไม่มีโปรแกรมแข่งขันสำหรับวันดังกล่าว (หรือ API ยังไม่อัปเดตข้อมูล)")
+            print("ยังไม่มีโปรแกรมแข่งขันในช่วงวันดังกล่าว (หรือ API ยังไม่อัปเดตข้อมูล)")
         print("=" * 70)
-        print(f"แสดง {shown_count} คู่ จากทั้งหมด {total_count} คู่")
+        print(f"แสดง {shown_count} คู่ ({len(dates)} วัน) จากทั้งหมด {total_count} คู่")
         return
 
-    for league, matches in groups:
+    for date_str, league_groups in days:
         print()
-        print(f"[{league['name_th']}] ({league['name_en']})")
-        print("-" * 70)
-        for kickoff, home, away in matches:
-            print(f"  {kickoff}  {home} vs {away}")
+        print(f"===== {day_label(date_str, dates)} =====")
+        for league, matches in league_groups:
+            print()
+            print(f"[{league['name_th']}] ({league['name_en']})")
+            print("-" * 70)
+            for kickoff, home, away in matches:
+                print(f"  {kickoff}  {home} vs {away}")
 
     print()
     print("=" * 70)
-    print(f"แสดง {shown_count} คู่ จากทั้งหมด {total_count} คู่")
+    print(f"แสดง {shown_count} คู่ ({len(dates)} วัน) จากทั้งหมด {total_count} คู่")
 
 
 def main():
     leagues = load_leagues()
     api_key = get_api_key()
-    date_str = tomorrow_date_str(get_bangkok_tz())
+    tz = get_bangkok_tz()
+    dates = date_range(tz)
 
-    print(f"กำลังดึงข้อมูลโปรแกรมบอลวันที่ {date_str} ...")
-    fixtures = fetch_fixtures(api_key, date_str)
-    print_fixtures(group_by_league(fixtures, leagues), len(fixtures), date_str)
+    print(f"กำลังดึงข้อมูลโปรแกรมบอลวันที่ {dates[0]} ถึง {dates[-1]} ...")
+    fixtures = fetch_fixtures(api_key, dates[0], dates[-1])
+    print_fixtures(group_by_day_and_league(fixtures, leagues, tz), len(fixtures), dates)
 
 
 if __name__ == "__main__":
