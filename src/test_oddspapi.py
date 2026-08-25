@@ -1,10 +1,14 @@
 """
-สคริปต์สำรวจ OddsPapi API (รันครั้งเดียวพอ — free tier มีแค่ 250 requests/เดือน)
+สคริปต์สำรวจ OddsPapi API — เจาะดูราคาของ "บิ๊กแมตช์" จริง ๆ
 
-ยิงรวมไม่เกิน 3 requests:
-    1) GET /fixtures  รายการคู่บอลวันนี้–พรุ่งนี้ (ดูว่าคู่ไหนมีราคา)
-    2) (ไม่ยิง API)   คัดคู่เป้าหมายจากผลขั้น 1 ในหน่วยความจำ
-    3) GET /odds      ราคาของคู่ที่เลือก ดูว่ามีเจ้าไหนบ้าง โครงสร้างหน้าตาอย่างไร
+ยิงไม่เกิน 2 requests (free tier 250 ครั้ง/เดือน ต้องประหยัด):
+    1) GET /fixtures  คู่บอลวันนี้ถึงมะรืน
+    2) (ไม่ยิง API)   ดูว่า OddsPapi เรียกลีก/ประเทศว่าอะไร แล้วคัดบิ๊กแมตช์ด้วยเงื่อนไขเข้ม
+    3) GET /odds      ราคาของคู่ที่เลือก + เช็ครายชื่อเจ้ามือ
+
+บทเรียนจากรอบก่อน: การ match ด้วย substring "premier league" ไปโดน
+"Northern Territory Premier League" ของออสเตรเลีย รอบนี้จึงบังคับว่า
+categoryName (ประเทศ) ต้องตรงกับที่กำหนด และ tournamentName ต้องตรงเป๊ะกับชื่อที่ยอมรับ
 
 วิธีใช้:
     # ใส่ ODDSPAPI_KEY ลงใน .env ก่อน
@@ -13,7 +17,9 @@
 
 import json
 import os
+import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta
 
 import requests
@@ -25,22 +31,35 @@ BASE_URL = "https://api.oddspapi.io/v4"
 SPORT_ID = 10  # ฟุตบอล
 REQUEST_TIMEOUT = 30
 
-# กันเผลอยิงเกินโควตา — สคริปต์นี้ต้องใช้ไม่เกิน 3 ครั้ง
-MAX_REQUESTS = 3
+# กันเผลอยิงเกินโควตา — รอบนี้ต้องใช้ไม่เกิน 2 ครั้ง
+MAX_REQUESTS = 2
 
-# คู่/ลีกที่อยากได้เป็นตัวอย่างในขั้น 2 (คัดในหน่วยความจำ ไม่ยิง API เพิ่ม)
-TARGET_TEAMS = ("manchester city", "bournemouth")
-TARGET_TOURNAMENTS = ("premier league",)
+DAYS_AHEAD = 3  # วันนี้ + พรุ่งนี้ + มะรืน
 
-# market id ที่สนใจ (ตามเอกสาร OddsPapi)
-MARKET_AH_HOME = 1068  # Asian Handicap -0.5 ฝั่งเหย้า
-MARKET_AH_AWAY = 1069  # Asian Handicap -0.5 ฝั่งเยือน
+# ลีกใหญ่ที่ยอมรับ: ประเทศ (categoryName) ต้องตรง และชื่อรายการต้องตรงเป๊ะกับ alias ที่ระบุ
+# เรียงตามลำดับความสำคัญ ใช้ตัดสินตอนต้องเลือกคู่ด้วย
+BIG_LEAGUES = (
+    ("Premier League (England)", {"england"}, {"premier league", "english premier league"}),
+    ("Champions League", {"europe", "uefa", "international clubs", "international", "world"},
+     {"champions league", "uefa champions league"}),
+    ("La Liga (Spain)", {"spain"}, {"laliga", "la liga", "laliga santander", "primera division",
+                                    "primera división"}),
+    ("Serie A (Italy)", {"italy"}, {"serie a"}),
+    ("Bundesliga (Germany)", {"germany"}, {"bundesliga", "1. bundesliga", "1 bundesliga"}),
+)
+
+# เจ้ามือที่อยากรู้ว่ามีให้ใช้ไหม (เอเชีย + เจ้าใหญ่)
+KEY_BOOKMAKERS = ("sbobet", "singbet", "pinnacle", "crown", "bet365", "188bet", "ibcbet")
+ASIAN_BOOKMAKERS = ("sbobet", "singbet", "crown", "188bet", "ibcbet")
+
+# market id ที่สนใจ
 MARKET_1X2 = (("home", 101), ("draw", 102), ("away", 103))
+MARKET_AH_MINUS_05 = ("Asian Handicap -0.5", 1068, 1069)  # (ชื่อ, ฝั่งเหย้า, ฝั่งเยือน)
+MARKET_AH_0 = ("Asian Handicap 0", 1072, 1073)
 
-# เจ้ามือฝั่งเอเชียที่อยากรู้ว่ามีให้ใช้ไหม
-ASIAN_BOOKMAKERS = ("sbobet", "singbet", "pinnacle")
-
-SAMPLE_FIXTURES = 10
+# ฟิลด์ที่ "อาจ" บอกจำนวนเจ้ามือของแต่ละคู่ (ยังไม่รู้ชื่อจริง เลยลองหลายแบบ)
+BOOKMAKER_COUNT_FIELDS = ("bookmakerCount", "bookmakersCount", "numBookmakers",
+                          "oddsCount", "bookmakers", "bookmakerIds")
 
 
 class RequestCounter:
@@ -124,10 +143,7 @@ def api_get(endpoint, api_key, params, counter, label):
 
 
 def as_list(payload, *keys):
-    """
-    ดึง list ออกจากผลลัพธ์ — รองรับทั้งแบบ list ตรง ๆ และแบบห่อใน dict
-    (ยังไม่รู้โครงสร้างจริงของ OddsPapi จึงเผื่อไว้หลายแบบ)
-    """
+    """ดึง list ออกจากผลลัพธ์ — รองรับทั้ง list ตรง ๆ และแบบห่อใน dict"""
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -148,10 +164,58 @@ def dig(data, *keys, default=None):
     return default if current is None else current
 
 
+def normalize(text):
+    """ตัดช่องว่างซ้ำ/เครื่องหมาย แล้วทำเป็นตัวพิมพ์เล็ก เพื่อเทียบชื่อแบบตรงตัว"""
+    cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def fixture_label(fixture):
     home = fixture.get("participant1Name") or "?"
     away = fixture.get("participant2Name") or "?"
     return f"{home} vs {away}"
+
+
+def big_league_of(fixture):
+    """
+    คืนชื่อลีกใหญ่ที่ fixture นี้สังกัด หรือ None ถ้าไม่ใช่ลีกใหญ่
+    เงื่อนไขเข้ม: ประเทศต้องตรง และชื่อรายการต้องตรงเป๊ะกับ alias
+    (กัน "Northern Territory Premier League" ของออสเตรเลียหลุดเข้ามา)
+    """
+    category = normalize(fixture.get("categoryName"))
+    tournament = normalize(fixture.get("tournamentName"))
+
+    for name, categories, tournaments in BIG_LEAGUES:
+        if category in categories and tournament in tournaments:
+            return name
+    return None
+
+
+def big_league_rank(fixture):
+    """ลำดับความสำคัญของลีกใหญ่ (เลขน้อย = สำคัญกว่า) ใช้ตัดสินตอนเลือกคู่"""
+    name = big_league_of(fixture)
+    for index, (league_name, _, _) in enumerate(BIG_LEAGUES):
+        if league_name == name:
+            return index
+    return len(BIG_LEAGUES)
+
+
+def bookmaker_count(fixture):
+    """
+    เดาจำนวนเจ้ามือของคู่นี้จากฟิลด์ที่ API อาจส่งมา — ไม่มีข้อมูลคืน None
+    (ยังไม่รู้ชื่อฟิลด์จริง จึงลองหลายชื่อ ทั้งที่เป็นตัวเลขและที่เป็น list)
+    """
+    for field in BOOKMAKER_COUNT_FIELDS:
+        value = fixture.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, (list, dict)):
+            return len(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
 
 
 def market_price(book_odds, market_id):
@@ -191,15 +255,15 @@ def market_price(book_odds, market_id):
 
 
 def step1_fixtures(api_key, counter):
-    """ขั้น 1: ดึงรายการคู่บอลวันนี้–พรุ่งนี้"""
+    """ขั้น 1: ดึงรายการคู่บอลวันนี้ถึงมะรืน แล้วเก็บเฉพาะที่มีราคา"""
     tz = get_bangkok_tz()
     today = datetime.now(tz).date()
     date_from = today.strftime("%Y-%m-%d")
-    date_to = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    date_to = (today + timedelta(days=DAYS_AHEAD - 1)).strftime("%Y-%m-%d")
 
-    print("=" * 70)
+    print("=" * 78)
     print(f"ขั้น 1: GET /fixtures  (sportId={SPORT_ID}, from={date_from}, to={date_to})")
-    print("=" * 70)
+    print("=" * 78)
 
     payload = api_get(
         "fixtures", api_key,
@@ -215,57 +279,98 @@ def step1_fixtures(api_key, counter):
 
     if isinstance(payload, dict):
         print(f"คีย์ระดับบนสุดของ response: {sorted(payload)}")
-    if fixtures and isinstance(fixtures[0], dict):
-        print(f"คีย์ของ fixture หนึ่งรายการ: {sorted(fixtures[0])}")
-
-    if not with_odds:
-        print("\n[!] ไม่มีคู่ไหนมีราคาเลยในช่วงวันนี้–พรุ่งนี้")
-        return with_odds
-
-    print(f"\nตัวอย่าง {min(SAMPLE_FIXTURES, len(with_odds))} คู่แรกที่มีราคา:")
-    print("-" * 70)
-    for fixture in with_odds[:SAMPLE_FIXTURES]:
-        print(f"  [{fixture.get('fixtureId')}] {fixture_label(fixture)}")
-        print(f"       ลีก: {fixture.get('tournamentName')}"
-              f" | เวลาแข่ง: {fixture.get('startTime') or fixture.get('startDate') or '?'}")
+    if with_odds:
+        print(f"คีย์ของ fixture หนึ่งรายการ: {sorted(with_odds[0])}")
 
     return with_odds
 
 
+def print_league_inventory(with_odds):
+    """พิมพ์ categoryName + tournamentName ที่ไม่ซ้ำกัน — ให้เห็นว่า OddsPapi เรียกลีกว่าอะไรจริง ๆ"""
+    print("\n" + "-" * 78)
+    print("ลีก/ประเทศทั้งหมดที่เจอ (categoryName | tournamentName | จำนวนคู่)")
+    print("-" * 78)
+
+    tally = Counter(
+        (fixture.get("categoryName") or "?", fixture.get("tournamentName") or "?")
+        for fixture in with_odds
+    )
+
+    for (category, tournament), count in sorted(tally.items()):
+        mark = ""
+        sample = next((f for f in with_odds
+                       if (f.get("categoryName") or "?") == category
+                       and (f.get("tournamentName") or "?") == tournament), None)
+        if sample is not None and big_league_of(sample):
+            mark = "  <<< ลีกใหญ่"
+        print(f"  {category:<28} | {tournament:<38} | {count}{mark}")
+
+    print(f"\nรวม {len(tally)} รายการที่ไม่ซ้ำกัน")
+
+
 def step2_pick(with_odds):
-    """ขั้น 2: คัดคู่เป้าหมายจากผลขั้น 1 (ไม่ยิง API เพิ่ม)"""
+    """ขั้น 2: คัดบิ๊กแมตช์จากผลขั้น 1 (ไม่ยิง API เพิ่ม)"""
     print()
-    print("=" * 70)
-    print("ขั้น 2: คัดคู่เป้าหมายจากข้อมูลที่ได้มาแล้ว (ไม่ยิง API)")
-    print("=" * 70)
+    print("=" * 78)
+    print("ขั้น 2: ดูรายชื่อลีกจริง แล้วคัดบิ๊กแมตช์ (ไม่ยิง API)")
+    print("=" * 78)
 
     if not with_odds:
-        fail("[ERROR] ไม่มีคู่ที่มีราคาให้ทดสอบขั้น 3")
+        fail("[ERROR] ไม่มีคู่ที่มีราคาเลย — ทดสอบขั้น 3 ต่อไม่ได้")
 
-    for fixture in with_odds:
-        names = f"{fixture.get('participant1Name') or ''} {fixture.get('participant2Name') or ''}".lower()
-        tournament = (fixture.get("tournamentName") or "").lower()
+    print_league_inventory(with_odds)
 
-        if any(team in names for team in TARGET_TEAMS) or any(t in tournament for t in TARGET_TOURNAMENTS):
-            print(f"เจอคู่เป้าหมาย: [{fixture.get('fixtureId')}] {fixture_label(fixture)}")
-            print(f"   ลีก: {fixture.get('tournamentName')}")
-            return fixture
+    big = [f for f in with_odds if big_league_of(f)]
 
-    fixture = with_odds[0]
-    print("ไม่เจอคู่เป้าหมาย (Manchester City / Bournemouth / Premier League)")
-    print(f"ใช้คู่แรกที่มีราคาแทน: [{fixture.get('fixtureId')}] {fixture_label(fixture)}")
-    print(f"   ลีก: {fixture.get('tournamentName')}")
-    return fixture
+    print("\n" + "-" * 78)
+    print("คู่ในลีกใหญ่ที่ผ่านเงื่อนไขเข้ม (ประเทศตรง + ชื่อรายการตรงเป๊ะ)")
+    print("-" * 78)
+
+    if not big:
+        print("  ไม่เจอคู่ในลีกใหญ่เลยในช่วง 3 วันนี้")
+        print("  (ถ้าในตารางด้านบนมีลีกใหญ่ที่สะกดต่างจากที่โค้ดรู้จัก ให้เพิ่ม alias ใน BIG_LEAGUES)")
+
+        fallback = max(with_odds, key=lambda f: (bookmaker_count(f) or 0))
+        print(f"\nเลือกคู่ที่มีเจ้ามือมากที่สุดแทน: [{fallback.get('fixtureId')}] {fixture_label(fallback)}")
+        print(f"   {fallback.get('categoryName')} | {fallback.get('tournamentName')}"
+              f" | เจ้ามือ: {bookmaker_count(fallback) if bookmaker_count(fallback) is not None else 'ไม่ทราบ'}")
+        return fallback
+
+    for fixture in big:
+        count = bookmaker_count(fixture)
+        print(f"  [{fixture.get('fixtureId')}] {fixture_label(fixture)}")
+        print(f"       {fixture.get('categoryName')} | {fixture.get('tournamentName')}"
+              f" | {fixture.get('startTime') or fixture.get('startDate') or '?'}"
+              f" | เจ้ามือ: {count if count is not None else 'ไม่ทราบ'}")
+
+    # เลือกคู่ที่มีเจ้ามือเยอะสุด ถ้า API ไม่บอกจำนวน ให้ตัดสินด้วยลำดับความสำคัญของลีก
+    chosen = max(big, key=lambda f: (bookmaker_count(f) or 0, -big_league_rank(f)))
+    counts_known = any(bookmaker_count(f) is not None for f in big)
+
+    print(f"\nเลือก: [{chosen.get('fixtureId')}] {fixture_label(chosen)}"
+          f"  ({big_league_of(chosen)})")
+    print("เหตุผล: " + ("มีเจ้ามือมากที่สุดในกลุ่มลีกใหญ่"
+                        if counts_known else
+                        "API ไม่ได้บอกจำนวนเจ้ามือในขั้นนี้ จึงเลือกตามลำดับความสำคัญของลีก"))
+    return chosen
+
+
+def bookmaker_checklist(bookmakers):
+    """เช็คทีละเจ้าว่ามีในผลลัพธ์ไหม — คืน dict {ชื่อที่ค้นหา: slug จริงที่เจอ หรือ None}"""
+    found = {}
+    for name in KEY_BOOKMAKERS:
+        found[name] = next((slug for slug in bookmakers if name in slug.lower()), None)
+    return found
 
 
 def step3_odds(api_key, fixture, counter):
-    """ขั้น 3: ดึงราคาของคู่ที่เลือก แล้วสำรวจโครงสร้าง"""
+    """ขั้น 3: ดึงราคาของคู่ที่เลือก แล้วสำรวจเจ้ามือ/market"""
     fixture_id = fixture.get("fixtureId")
 
     print()
-    print("=" * 70)
+    print("=" * 78)
     print(f"ขั้น 3: GET /odds  (fixtureId={fixture_id}) — {fixture_label(fixture)}")
-    print("=" * 70)
+    print("=" * 78)
 
     if fixture_id is None:
         fail("[ERROR] คู่ที่เลือกไม่มี fixtureId — ดึงราคาต่อไม่ได้")
@@ -286,55 +391,63 @@ def step3_odds(api_key, fixture, counter):
         return
 
     bookmakers = sorted(book_odds)
-    print(f"\nจำนวนเจ้ามือที่ price คู่นี้: {len(bookmakers)}")
-    print(f"รายชื่อ: {', '.join(bookmakers)}")
+    print(f"\nเจ้ามือทั้งหมด {len(bookmakers)} เจ้า (เรียงตามตัวอักษร):")
+    for index in range(0, len(bookmakers), 4):
+        print("  " + "  ".join(f"{slug:<18}" for slug in bookmakers[index:index + 4]))
 
-    asian = [b for b in bookmakers if any(name in b.lower() for name in ASIAN_BOOKMAKERS)]
-    print(f"\nเจ้าฝั่งเอเชียที่เจอ ({', '.join(ASIAN_BOOKMAKERS)}): {', '.join(asian) if asian else 'ไม่เจอเลย'}")
+    print("\n" + "-" * 78)
+    print("เช็คเจ้าสำคัญ")
+    print("-" * 78)
+    checklist = bookmaker_checklist(bookmakers)
+    for name, slug in checklist.items():
+        status = f"✅ มี  (slug จริง: {slug})" if slug else "❌ ไม่มี"
+        print(f"  {name:<10} {status}")
 
-    print(f"\nAsian Handicap -0.5 (market {MARKET_AH_HOME} = เหย้า, {MARKET_AH_AWAY} = เยือน):")
-    print("-" * 70)
-    found_ah = False
-    for slug in bookmakers:
-        home = market_price(book_odds[slug], MARKET_AH_HOME)
-        away = market_price(book_odds[slug], MARKET_AH_AWAY)
-        if home is None and away is None:
-            continue
-        found_ah = True
-        print(f"  {slug:<20} home {home}  |  away {away}")
-    if not found_ah:
-        print("  ไม่มีเจ้าไหนเสนอ market นี้ (หรือโครงสร้างต่างจากที่คาด)")
+    key_slugs = [slug for slug in checklist.values() if slug]
+    if not key_slugs:
+        print("\n[!] ไม่เจอเจ้าสำคัญเลย — แสดงราคาของ 5 เจ้าแรกแทน")
+        key_slugs = bookmakers[:5]
 
-    print(f"\n1X2 (market {[mid for _, mid in MARKET_1X2]}):")
-    print("-" * 70)
-    found_1x2 = False
-    for slug in bookmakers:
+    print("\n" + "-" * 78)
+    print(f"1X2 (market {[mid for _, mid in MARKET_1X2]}) ของเจ้าสำคัญ")
+    print("-" * 78)
+    for slug in key_slugs:
         prices = {label: market_price(book_odds[slug], mid) for label, mid in MARKET_1X2}
-        if all(value is None for value in prices.values()):
-            continue
-        found_1x2 = True
-        print(f"  {slug:<20} home {prices['home']}  |  draw {prices['draw']}  |  away {prices['away']}")
-    if not found_1x2:
-        print("  ไม่มีเจ้าไหนเสนอ market นี้ (หรือโครงสร้างต่างจากที่คาด)")
+        print(f"  {slug:<18} home {prices['home']}  |  draw {prices['draw']}  |  away {prices['away']}")
 
-    sample_slug = next((b for b in bookmakers if "pinnacle" in b.lower()), bookmakers[0])
-    print(f"\nJSON ดิบของเจ้า '{sample_slug}' (ดูโครงสร้างเต็ม):")
-    print("-" * 70)
-    print(json.dumps(book_odds[sample_slug], ensure_ascii=False, indent=2)[:4000])
+    for label, home_market, away_market in (MARKET_AH_MINUS_05, MARKET_AH_0):
+        print("\n" + "-" * 78)
+        print(f"{label} (market {home_market} = เหย้า, {away_market} = เยือน) ของเจ้าสำคัญ")
+        print("-" * 78)
+        for slug in key_slugs:
+            home = market_price(book_odds[slug], home_market)
+            away = market_price(book_odds[slug], away_market)
+            print(f"  {slug:<18} home {home}  |  away {away}")
+
+    sample_slug = next((s for s in key_slugs if "pinnacle" in s.lower()), key_slugs[0])
+    print("\n" + "-" * 78)
+    print(f"JSON ดิบของเจ้า '{sample_slug}' (ไว้เทียบว่า market id ที่ใช้ถูกไหม)")
+    print("-" * 78)
+    print(json.dumps(book_odds[sample_slug], ensure_ascii=False, indent=2)[:3000])
+
+    asian_found = [slug for slug in bookmakers
+                   if any(name in slug.lower() for name in ASIAN_BOOKMAKERS)]
+    print("\n" + "=" * 78)
+    print(f"สรุป: เจ้ามือทั้งหมด {len(bookmakers)} เจ้า | เจ้าเอเชีย {len(asian_found)} เจ้า"
+          f"{' (' + ', '.join(asian_found) + ')' if asian_found else ''}")
 
 
 def main():
     api_key = get_api_key()
     counter = RequestCounter()
 
-    print("สำรวจ OddsPapi — สคริปต์นี้ยิงไม่เกิน 3 requests\n")
+    print(f"สำรวจ OddsPapi — สคริปต์นี้ยิงไม่เกิน {MAX_REQUESTS} requests\n")
 
     with_odds = step1_fixtures(api_key, counter)
     fixture = step2_pick(with_odds)
     step3_odds(api_key, fixture, counter)
 
-    print()
-    print("=" * 70)
+    print("=" * 78)
     print(f"จบการสำรวจ — ยิง API ไปทั้งหมด {counter.count} ครั้ง (เพดาน {counter.limit})")
 
 
