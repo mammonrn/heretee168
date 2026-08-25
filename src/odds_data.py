@@ -21,11 +21,17 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
 from api_football import fail, get_bangkok_tz
+
+# เปิด ODDS_DEBUG_DUMP=1 เพื่อเซฟ raw response ของ /odds ลงไฟล์
+# มีไว้เพราะโครงสร้าง OddsPapi เคยเปลี่ยนมาแล้ว ครั้งหน้าจะได้ตรวจจากไฟล์ ไม่ต้องยิง API ซ้ำ
+DEBUG_DUMP_ENV = "ODDS_DEBUG_DUMP"
+DEBUG_DUMP_PATH = Path(__file__).resolve().parent.parent / "debug_raw_odds.json"
 
 BASE = "https://api.oddspapi.io/v4"
 SPORT_ID = 10  # ฟุตบอล
@@ -189,9 +195,29 @@ def fetch_oddspapi_fixtures(dates, api_key=None, counter=None):
     return with_odds
 
 
+def dump_raw_odds(payload, fixture_id):
+    """เซฟ raw response ลงไฟล์เมื่อเปิด ODDS_DEBUG_DUMP=1 — เขียนไม่สำเร็จก็แค่เตือน ไม่ให้พัง"""
+    if (os.getenv(DEBUG_DUMP_ENV) or "").strip() not in ("1", "true", "TRUE", "yes"):
+        return
+
+    try:
+        DEBUG_DUMP_PATH.write_text(
+            json.dumps({"fixtureId": fixture_id, "response": payload}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("เซฟ raw response ของ /odds ไว้ที่ %s (ตรวจโครงสร้างได้โดยไม่ต้องยิง API ซ้ำ)",
+                    DEBUG_DUMP_PATH)
+    except OSError as exc:
+        logger.warning("เซฟไฟล์ debug ไม่สำเร็จ (%s) — ข้ามไป", exc)
+
+
 def fetch_odds(oddspapi_fixture_id, api_key=None, counter=None):
-    """ยิง /odds ของคู่ที่ระบุ แล้วคืน bookmakerOdds ดิบ (dict ว่างถ้าไม่มี)"""
+    """
+    ยิง /odds ของคู่ที่ระบุ แล้วคืน bookmakerOdds ดิบ (dict ว่างถ้าไม่มี)
+    ตั้ง ODDS_DEBUG_DUMP=1 ถ้าอยากได้ raw response เก็บไว้ตรวจโครงสร้างทีหลัง
+    """
     payload = api_get("odds", {"fixtureId": oddspapi_fixture_id}, api_key=api_key, counter=counter)
+    dump_raw_odds(payload, oddspapi_fixture_id)
 
     if isinstance(payload, dict) and isinstance(payload.get("bookmakerOdds"), dict):
         return payload["bookmakerOdds"]
@@ -353,19 +379,18 @@ def match_fixture(oddspapi_fixtures, home_name, away_name, kickoff_iso=None, lea
 # ---------- การกลั่นราคา ----------
 
 
-def find_outcome(book_data, market_id):
+def find_market_entry(book_data, market_id):
     """
-    หา outcome ของ market ที่ต้องการจากข้อมูลเจ้ามือหนึ่งเจ้า
-    รองรับหลายรูปแบบ (dict คีย์เป็น market id, ซ้อนใน markets/odds/outcomes, list ของ object)
-    เพราะโครงสร้างจริงของ OddsPapi ยังไม่นิ่ง
+    หา entry ของ market ที่ต้องการจากข้อมูลเจ้ามือหนึ่งเจ้า (ยังไม่แกะชั้น outcomes)
+    คืนตัว entry ดิบ เพราะบางฟิลด์ เช่น changedAt อาจอยู่ระดับ market ไม่ใช่ในระดับ outcome
     """
     if isinstance(book_data, dict):
         for key in (str(market_id), market_id):
             if key in book_data:
                 return book_data[key]
-        for nested in ("markets", "odds", "outcomes", "prices"):
+        for nested in ("markets", "odds", "prices"):
             if isinstance(book_data.get(nested), (dict, list)):
-                found = find_outcome(book_data[nested], market_id)
+                found = find_market_entry(book_data[nested], market_id)
                 if found is not None:
                     return found
 
@@ -377,6 +402,41 @@ def find_outcome(book_data, market_id):
                     return item
 
     return None
+
+
+def unwrap_outcome(entry):
+    """
+    แกะชั้น "outcomes" ออกจน (เกือบ) ถึงตัวที่มี players
+
+    โครงสร้างจริงของ OddsPapi ที่ยืนยันจากการรันจริงคือ
+        bookmakerOdds[slug]["markets"][market_id]["outcomes"]["players"]["0"]["price"]
+    เดิมโค้ดหยุดที่ระดับ market_id แล้วส่งต่อให้ outcome_price เลย ทำให้หา players ไม่เจอ
+    ราคาจึงออกมาเป็น null ทั้งหมด — ฟังก์ชันนี้แกะชั้นที่หายไปให้
+    (รองรับทั้งกรณี outcomes เป็น dict และเป็น list ของ outcome)
+    """
+    current = entry
+    for _ in range(4):  # กันวนไม่จบถ้าโครงสร้างแปลก
+        if not isinstance(current, dict) or "players" in current:
+            return current
+
+        inner = current.get("outcomes")
+        if isinstance(inner, dict):
+            current = inner
+            continue
+        if isinstance(inner, list):
+            first = next((item for item in inner if isinstance(item, dict)), None)
+            if first is None:
+                return current
+            current = first
+            continue
+        return current
+
+    return current
+
+
+def find_outcome(book_data, market_id):
+    """หา outcome ของ market ที่ต้องการ แล้วแกะชั้น outcomes ให้เรียบร้อยก่อนคืนค่า"""
+    return unwrap_outcome(find_market_entry(book_data, market_id))
 
 
 def outcome_price(outcome):
@@ -428,10 +488,15 @@ def outcome_changed_at(outcome):
 
 def price_of(book_data, market_id, changed_stamps):
     """ดึงราคาของ market เดียว พร้อมเก็บ changedAt ไว้หาค่าล่าสุดทีหลัง"""
-    outcome = find_outcome(book_data, market_id)
-    stamp = outcome_changed_at(outcome)
-    if stamp:
-        changed_stamps.append(stamp)
+    entry = find_market_entry(book_data, market_id)
+    outcome = unwrap_outcome(entry)
+
+    # changedAt อาจอยู่ที่ระดับ market หรือระดับ outcome ก็ได้ เก็บอันที่เจอก่อน
+    for stamp in (outcome_changed_at(entry), outcome_changed_at(outcome)):
+        if stamp:
+            changed_stamps.append(stamp)
+            break
+
     return outcome_price(outcome)
 
 

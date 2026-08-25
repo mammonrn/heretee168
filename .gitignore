@@ -7,6 +7,9 @@ cache.db-journal
 cache.db-wal
 cache.db-shm
 
+# ไฟล์ debug ที่ ODDS_DEBUG_DUMP=1 เซฟไว้ (raw response จาก OddsPapi)
+debug_raw_odds.json
+
 # Virtual environment
 venv/
 .venv/
