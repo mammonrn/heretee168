@@ -105,9 +105,9 @@ POSTGROUP_NO_GROUP = (
 )
 POSTGROUP_FAILED = "โพสต์ลงกลุ่มไม่สำเร็จครับ ดูรายละเอียดใน log ของบอท"
 
-BACK_TO_DAYS = "⬅️ ย้อนกลับ"
-BACK_TO_LEAGUES = "⬅️ ย้อนกลับ"
-BACK_TO_MATCHES = "⬅️ เลือกคู่อื่น"
+# ปุ่มย้อนกลับมีแบบเดียว: พากลับหน้าแรก (เมนูเลือกวัน) ไม่ต้องย้อนทีละชั้น
+BACK_TO_HOME = "⬅️ กลับหน้าแรก"
+BACK_HOME_CALLBACK = "back:home"
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -322,7 +322,7 @@ def league_keyboard(snapshot, date_str):
             f"{league['name_th']} · {len(matches)} คู่",
             callback_data=f"league:{league['id']}:{date_str}",
         )])
-    buttons.append([InlineKeyboardButton(BACK_TO_DAYS, callback_data="back:days")])
+    buttons.append([InlineKeyboardButton(BACK_TO_HOME, callback_data=BACK_HOME_CALLBACK)])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -339,16 +339,14 @@ def match_keyboard(snapshot, date_str, league_id):
             callback_data=f"match:{fixture_id}:{date_str}:{league_id}",
         )])
 
-    buttons.append([InlineKeyboardButton(BACK_TO_LEAGUES, callback_data=f"back:leagues:{date_str}")])
+    buttons.append([InlineKeyboardButton(BACK_TO_HOME, callback_data=BACK_HOME_CALLBACK)])
     return InlineKeyboardMarkup(buttons)
 
 
-def after_analysis_keyboard(date_str, league_id):
-    """ปุ่มหลังอ่านบทวิเคราะห์จบ — กลับไปเลือกคู่อื่นในลีกเดิม"""
-    return InlineKeyboardMarkup([[InlineKeyboardButton(
-        BACK_TO_MATCHES,
-        callback_data=f"back:matches:{date_str}:{league_id}",
-    )]])
+def home_keyboard():
+    """ปุ่มเดียวสำหรับย้อนกลับทุกจุด — พากลับหน้าแรก (เมนูเลือกวัน)"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BACK_TO_HOME,
+                                                       callback_data=BACK_HOME_CALLBACK)]])
 
 
 async def get_snapshot(context):
@@ -495,55 +493,31 @@ async def match_handler(update, context):
     except SystemExit as exc:
         # โค้ดเดิมใช้ fail() ที่เรียก sys.exit — ในบอทถือเป็นข้อผิดพลาดธรรมดา ห้ามให้บอทตาย
         logger.error("วิเคราะห์ fixture_id=%s ไม่สำเร็จ (fail/exit code=%s)", fixture_id, exc.code)
-        await safe_edit(query, ERROR_MESSAGE, after_analysis_keyboard(date_str, league_id))
+        await safe_edit(query, ERROR_MESSAGE, home_keyboard())
         return
     except Exception:
         logger.exception("วิเคราะห์ fixture_id=%s ไม่สำเร็จ", fixture_id)
-        await safe_edit(query, ERROR_MESSAGE, after_analysis_keyboard(date_str, league_id))
+        await safe_edit(query, ERROR_MESSAGE, home_keyboard())
         return
 
     logger.info(
         "ส่งบทวิเคราะห์ %s (จากแคช=%s, ยิง API-SPORTS %d ครั้ง)",
         result["match_name"], result["from_cache"], result["sports_requests"],
     )
-    await safe_edit(query, result["analysis"], after_analysis_keyboard(date_str, league_id))
+    await safe_edit(query, result["analysis"], home_keyboard())
 
 
 @private_only
 async def back_handler(update, context):
-    """ปุ่มย้อนกลับทุกระดับ: back:days / back:leagues:<date> / back:matches:<date>:<league_id>"""
+    """
+    ปุ่มย้อนกลับทุกจุดพากลับหน้าแรก (เมนูเลือกวัน) เลย ไม่ต้องย้อนทีละชั้น
+    รับ back: ทุกแบบ รวมถึง callback รูปแบบเก่าที่อาจค้างอยู่ในแชท
+    """
     query = update.callback_query
     await query.answer()
 
-    parts = query.data.split(":")
-    target = parts[1]
-
-    if target == "days":
-        await edit_to_days(query, context)
-        return
-
-    snapshot = await get_snapshot(context)
-    date_str = parts[2]
-
-    if target == "leagues":
-        if find_day(snapshot, date_str) is None:
-            await safe_edit(query, STALE_MENU, None)
-            return
-        await safe_edit(query, f"{day_label(date_str, snapshot['dates'])}\n{PICK_LEAGUE}",
-                        league_keyboard(snapshot, date_str))
-        return
-
-    if target == "matches":
-        league_id = int(parts[3])
-        league, _ = find_league(snapshot, date_str, league_id)
-        if league is None:
-            await safe_edit(query, STALE_MENU, None)
-            return
-        await safe_edit(
-            query,
-            f"{league['name_th']} — {day_label(date_str, snapshot['dates'])}\n{PICK_MATCH}",
-            match_keyboard(snapshot, date_str, league_id),
-        )
+    logger.info("กลับหน้าแรก (callback=%s, user_id=%s)", query.data, query.from_user.id)
+    await edit_to_days(query, context)
 
 
 # ไม่ครอบ private_only: จำกัดด้วย ADMIN_USER_ID อยู่แล้ว และแอดมินอาจสั่งจากที่ไหนก็ได้
