@@ -9,6 +9,8 @@ Unit test ของการหา "เส้นแฮนดิแคปหล�
     python3 src/test_mainline.py -v
 """
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -17,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import analyze
 import odds_data
+import test_odds_offline
 
 
 # ---------- ตัวช่วยสร้างข้อมูลจำลอง ----------
@@ -244,6 +247,106 @@ class TestRealPinnacleSample(unittest.TestCase):
         self.assertEqual(odds_data.main_line_player(outcome)["price"], 1.917)
         # ธงไม่ได้อยู่ระดับ outcome — ยืนยันว่าเราไม่ได้อ่านจากชั้นนั้น
         self.assertNotIn("mainLine", outcome)
+
+
+# ชุดเคสที่เคยทำให้รายงานกับผล JSON เล่าคนละเรื่อง — ต้องตรงกันทุกเคส
+CONSISTENCY_CASES = {
+    "เส้นหลักปกติ": REAL_PINNACLE_MARKETS,
+    "ปักธงหลายเส้น": {
+        "1058": group((1058, outcome(1.90, True)), (1059, outcome(1.90, True))),
+        "1068": group((1068, outcome(1.30, True)), (1069, outcome(3.45, True))),
+    },
+    "ปักธงแต่ราคาขาดฝั่งหนึ่ง": {
+        "1058": group((1058, outcome(1.917, True)), (1059, outcome(None, True))),
+        "1068": group((1068, outcome(1.30, False)), (1069, outcome(3.45, False))),
+    },
+    "ปักธงฝั่งเดียว": {
+        "1058": group((1058, outcome(1.917, True)), (1059, outcome(1.97, False))),
+        "1068": group((1068, outcome(1.30, False)), (1069, outcome(3.45, False))),
+    },
+    "ไม่มีธงเลย": {
+        "1068": group((1068, outcome(1.95)), (1069, outcome(1.90))),
+    },
+    "กลุ่มเดียวมี AH สามตัว": {
+        "1058": group((1058, outcome(1.91, True)), (1059, outcome(1.97, True)),
+                      (1068, outcome(1.30, True))),
+    },
+    "ไม่มี AH เลย": {
+        "101": group((101, outcome(1.80)), (102, outcome(3.50)), (103, outcome(4.20))),
+    },
+}
+
+
+class TestReportMatchesTheRealResult(unittest.TestCase):
+    """
+    รายงานวินิจฉัยกับ field "handicap" ที่ส่งเข้า prompt ต้องมาจากการตัดสินใจครั้งเดียวกัน
+
+    เคยแยกกัน: รายงานดูแค่ธง mainLine ส่วน distill_book ดูทั้งการจับคู่และราคาด้วย
+    ผลคือรายงานบอก "เจอเส้นหลักที่ 1058" แต่ JSON จริงกลับเป็น fallback เส้น 0.5
+    เทสต์กลุ่มนี้ล็อกไม่ให้สองฝั่งแยกกันได้อีก
+    """
+
+    def distilled(self, markets):
+        raw = {"pinnacle": book(markets)}
+        return odds_data.distill_odds(raw, CATALOG)["books"]["pinnacle"]["handicap"]
+
+    def test_every_case_agrees_between_scan_and_json(self):
+        for name, markets in CONSISTENCY_CASES.items():
+            with self.subTest(case=name):
+                scan = odds_data.scan_handicap_lines(book(markets), CATALOG)
+                handicap = self.distilled(markets)
+
+                if scan["main"] is None:
+                    self.assertNotEqual(
+                        (handicap or {}).get("source"), "mainline",
+                        f"[{name}] สแกนไม่เจอเส้นหลัก แต่ JSON กลับบอกว่าใช้เส้นหลัก")
+                else:
+                    self.assertIsNotNone(handicap, f"[{name}] สแกนเจอเส้นหลัก แต่ JSON ว่างเปล่า")
+                    self.assertEqual(handicap["source"], "mainline")
+                    self.assertEqual(handicap["handicap"], scan["main"]["handicap"])
+                    self.assertEqual(handicap["market_ids"], scan["main"]["market_ids"])
+
+    def test_printed_report_says_the_same_thing_as_the_json(self):
+        """อ่านข้อความที่รายงานพิมพ์จริง ๆ แล้วเทียบกับ JSON — กันไม่ให้ข้อความหลุดจากผล"""
+        for name, markets in CONSISTENCY_CASES.items():
+            with self.subTest(case=name):
+                raw = {"pinnacle": book(markets)}
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    test_odds_offline.report_main_lines(raw, CATALOG)
+
+                summary = next(line.split("สรุป:")[1].strip()
+                               for line in buffer.getvalue().splitlines() if "สรุป:" in line)
+                handicap = self.distilled(markets)
+                uses_main_line = (handicap or {}).get("source") == "mainline"
+
+                if uses_main_line:
+                    self.assertIn(f"market {handicap['market_ids']['home']}", summary,
+                                  f"[{name}] รายงานกับ JSON ชี้คนละ market")
+                    self.assertIn("ใช้เส้นหลัก", summary)
+                else:
+                    self.assertIn("ไม่ใช้เส้นหลัก", summary,
+                                  f"[{name}] JSON ไม่ได้ใช้เส้นหลัก แต่รายงานบอกว่าใช้")
+
+    def test_the_report_reads_from_the_same_function_as_distill(self):
+        """ไม่ใช่แค่ผลตรงกัน แต่ต้องเรียกฟังก์ชันตัดสินตัวเดียวกันจริง ๆ"""
+        raw = {"pinnacle": book(REAL_PINNACLE_MARKETS)}
+        from_report = test_odds_offline.main_line_conclusions(raw, CATALOG)["pinnacle"]["main"]
+        from_distill = odds_data.find_main_line(book(REAL_PINNACLE_MARKETS), CATALOG)
+
+        self.assertEqual(from_report, from_distill)
+        self.assertEqual(from_report["market_ids"]["home"], "1058")
+
+    def test_a_flagged_line_with_a_missing_price_is_not_reported_as_used(self):
+        """เคสที่เคยหลอกตา: รายงานเห็นธงเลยขึ้น mainLine แต่ระบบใช้ไม่ได้เพราะราคาขาด"""
+        markets = CONSISTENCY_CASES["ปักธงแต่ราคาขาดฝั่งหนึ่ง"]
+        scan = odds_data.scan_handicap_lines(book(markets), CATALOG)
+
+        self.assertEqual(scan["verdict"], "missing_price")
+        self.assertIsNone(scan["main"])
+        self.assertTrue(any(row["flag"] for row in scan["outcomes"]),
+                        "รายงานต้องยังโชว์ว่ามีธงอยู่ เพื่อให้เห็นว่าทำไมถึงใช้ไม่ได้")
+        self.assertEqual(self.distilled(markets)["source"], "fallback")
 
 
 class TestFallbackCatalogCoverage(unittest.TestCase):
@@ -483,7 +586,10 @@ class TestDistillWithMainLine(unittest.TestCase):
         result = odds_data.distill_odds(raw, CATALOG)
 
         self.assertEqual(result["books"]["pinnacle"]["handicap"]["source"], "fallback")
-        self.assertTrue(any("mainLine" in note for note in result["notes"]))
+        self.assertTrue(any("ไม่ได้ใช้เส้นหลัก" in note for note in result["notes"]))
+        # เหตุผลใน note ต้องเป็นตัวเดียวกับที่รายงานวินิจฉัยพิมพ์
+        verdict = result["books"]["pinnacle"]["handicap_verdict"]
+        self.assertTrue(any(odds_data.SCAN_VERDICTS[verdict] in note for note in result["notes"]))
 
     def test_works_without_a_catalog_at_all(self):
         raw = self.raw({"1068": group((1068, outcome(1.95, True)), (1069, outcome(1.90, True)))})
@@ -497,6 +603,7 @@ class TestDistillWithMainLine(unittest.TestCase):
 
         self.assertIsNone(result["books"]["pinnacle"]["handicap"])
         self.assertTrue(any("ไม่มีเส้นแฮนดิแคป" in note for note in result["notes"]))
+        self.assertEqual(result["books"]["pinnacle"]["handicap_verdict"], "no_ah_market")
 
 
 class TestHandicapLineLabel(unittest.TestCase):

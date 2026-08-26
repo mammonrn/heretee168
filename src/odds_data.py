@@ -980,87 +980,146 @@ def market_id_sort_key(market_id):
     return (0, int(text), "") if text.lstrip("-").isdigit() else (1, 0, text)
 
 
-def find_main_line(book_data, catalog, stamps=None):
+# คำอธิบายผลการสแกนของเจ้ามือหนึ่งเจ้า — ใช้ร่วมกันทั้งตอนตัดสินใจและตอนพิมพ์รายงาน
+# ข้อความชุดนี้อยู่ที่เดียว จะได้ไม่มีทางที่รายงานเล่าอย่าง แต่ผลจริงเป็นอีกอย่าง
+SCAN_VERDICTS = {
+    "mainline": "ใช้เส้นหลักที่ปักธงไว้",
+    "no_ah_market": "ไม่มี AH market ที่อยู่ในสารบัญเลย",
+    "no_pair": "มี AH market แต่ไม่มีกลุ่มไหนจับคู่เหย้า-เยือนได้พอดีสองตัว",
+    "not_flagged": "ไม่มีเส้นไหนปักธง mainLine ครบทั้งสองฝั่ง",
+    "missing_price": "ปักธงแล้วแต่ราคาไม่ครบสองฝั่ง",
+    "ambiguous": "ปักธงไว้หลายเส้น ธงของเจ้านี้เชื่อไม่ได้",
+}
+
+
+def scan_handicap_lines(book_data, catalog):
     """
-    สแกน AH market ทั้งหมดที่เจ้ามือเจ้านี้เสนอ แล้วหาเส้นที่ mainLine=true ทั้งสองฝั่ง
+    สแกน AH ทั้งหมดของเจ้ามือหนึ่งเจ้า แล้วคืน "ผลการตัดสินทั้งชุด" จากการเดินข้อมูลรอบเดียว
 
-    เกณฑ์ครบทุกข้อถึงจะรับ:
-      ก. กลุ่มนั้นมี market id ที่อยู่ในสารบัญ AH พอดีสองตัว (= ฝั่งเหย้ากับฝั่งเยือนของเส้นเดียวกัน)
-      ข. ทั้งสองฝั่ง mainLine=true (ฝั่งเดียวไม่พอ เดี๋ยวได้เส้นครึ่ง ๆ กลาง ๆ)
-         ธงอ่านจาก players["0"]["mainLine"] ของ outcome ตัวนั้นเอง ไม่มีธง = ไม่ใช่เส้นหลัก
-      ค. ทั้งสองฝั่งมีราคาจริงเป็นตัวเลข (ขาดฝั่งใดฝั่งหนึ่งเอาไปเทียบว่าใครต่อไม่ได้)
+    จุดสำคัญของฟังก์ชันนี้: ทั้งค่า handicap ที่ส่งเข้า prompt และรายงานวินิจฉัยในเครื่องมือ
+    debug ต้องอ่านจากผลชุดนี้ชุดเดียวเท่านั้น ห้ามใครไปไล่สแกนเองซ้ำอีกรอบ
+    ก่อนหน้านี้รายงานมีตรรกะของตัวเอง (ดูแค่ธง ไม่ได้ดูว่าจับคู่ได้ไหมหรือราคาครบไหม)
+    เลยเกิดกรณีที่รายงานบอก "เจอเส้นหลักที่ 1058" แต่ผล JSON จริงกลับเป็น fallback
 
-    เลขเส้นอ่านจากฝั่งเหย้า (market id น้อยกว่า) เสมอ ตามที่ยืนยันจากของจริง
-    (1068 = AH -0.5 คู่กับ 1069, 1058 = AH -1.75 คู่กับ 1059)
-    ถ้าเจอเส้นที่เข้าเกณฑ์มากกว่าหนึ่งเส้น ถือว่าธงของเจ้านี้เชื่อไม่ได้ แล้วคืน None
-
-    คืน dict ของเส้นหลัก หรือ None ถ้าไม่เจอ (ให้ปลายทาง fallback ไปเส้นตายตัว)
+    คืน dict:
+      outcomes = ทุก AH outcome ที่เจอ (market id, เลขเส้น, ธง, ราคา) ไว้ให้รายงานพิมพ์
+      pairs    = คู่เหย้า-เยือนที่จับได้ พร้อมผลตรวจว่าปักธงไหม ราคาครบไหม
+      main     = เส้นที่ระบบใช้จริง (source="mainline") หรือ None
+      verdict  = รหัสเหตุผลใน SCAN_VERDICTS ว่าทำไมได้/ไม่ได้เส้นหลัก
+      stamps   = changedAt ของเส้นที่เลือก
     """
     catalog = catalog or {}
-    candidates = []
+    rows, pairs = [], []
 
-    for _, mapping in market_groups(book_data):
-        ah_ids = [market_id for market_id in mapping if market_id in catalog]
+    for group_key, mapping in market_groups(book_data):
+        ah_ids = sorted((market_id for market_id in mapping if market_id in catalog),
+                        key=market_id_sort_key)
+        if not ah_ids:
+            continue
+
+        # แกะชั้นครั้งเดียวต่อ outcome แล้วใช้ตัวเดียวกันทั้งอ่านธงและอ่านราคา
+        # ธง mainLine กับ price อยู่ใน dict ใบเดียวกัน จึงต้องมาจาก object เดียวกันเสมอ
+        outcomes = {market_id: unwrap_outcome(mapping[market_id]) for market_id in ah_ids}
+
+        for market_id in ah_ids:
+            outcome = outcomes[market_id]
+            rows.append({
+                "market_id": market_id,
+                "group": group_key,
+                "handicap": catalog[market_id],
+                "flag": read_main_line_flag(outcome),
+                "price": outcome_price(outcome),
+            })
+
+        # กลุ่มที่ไม่ได้มี AH พอดีสองตัว จับคู่เหย้า-เยือนไม่ได้ ข้ามไป (แต่ยังโชว์ในรายงาน)
         if len(ah_ids) != 2:
             continue
 
-        home_id, away_id = sorted(ah_ids, key=market_id_sort_key)
+        home_id, away_id = ah_ids
+        home_outcome, away_outcome = outcomes[home_id], outcomes[away_id]
+        home_price, away_price = outcome_price(home_outcome), outcome_price(away_outcome)
 
-        # แกะชั้นครั้งเดียวแล้วใช้ตัวเดียวกันทั้งอ่านธงและอ่านราคา
-        # ธง mainLine กับ price อยู่ใน dict ใบเดียวกัน จึงต้องมาจาก object เดียวกันเสมอ
-        # (ถ้าแยกกันแกะ มีโอกาสที่ธงมาจาก outcome หนึ่งแต่ราคามาจากอีก outcome หนึ่ง)
-        home_outcome = unwrap_outcome(mapping[home_id])
-        away_outcome = unwrap_outcome(mapping[away_id])
-
-        if not (main_line_flag(home_outcome) and main_line_flag(away_outcome)):
-            continue
-
-        home_price = outcome_price(home_outcome)
-        away_price = outcome_price(away_outcome)
-        numeric = [isinstance(value, (int, float)) and not isinstance(value, bool)
-                   for value in (home_price, away_price)]
-        if not all(numeric):
-            logger.info("เจอเส้นหลัก (market %s/%s) แต่ราคาไม่ครบสองฝั่ง — ข้ามไปใช้เส้นสำรอง",
-                        home_id, away_id)
-            continue
-
-        handicap = catalog[home_id]
-        candidates.append({
+        pairs.append({
+            "home_id": home_id,
+            "away_id": away_id,
+            "handicap": catalog[home_id],
             "home": home_price,
             "away": away_price,
-            "handicap": handicap,
-            "line": abs(handicap),
-            "source": "mainline",
-            "market_ids": {"home": home_id, "away": away_id},
+            "flagged": main_line_flag(home_outcome) and main_line_flag(away_outcome),
+            "priced": all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                          for value in (home_price, away_price)),
             "outcomes": (home_outcome, away_outcome),
         })
 
-    if not candidates:
-        return None
+    return decide_main_line(rows, pairs)
 
-    # เจ้ามือหนึ่งเจ้าต้องมีเส้นหลักเส้นเดียว เจอมากกว่านั้นแปลว่าธงของเจ้านี้เชื่อไม่ได้
-    # (เคยเจอจริง: บางเจ้าปักธงไว้ทุกเส้น) จะเลือกเส้นไหนก็เป็นการเดาทั้งนั้น
-    # จึงถอยไปใช้เส้นตายตัวแทน ซึ่งติดป้าย fallback ไว้ ปลายทางจะไม่ไปพูดว่านี่คือเส้นที่ตลาดตั้ง
-    # ยอมได้เส้นสำรอง ดีกว่าหยิบเส้นมั่ว ๆ มาพูดว่าเป็นเส้นหลัก
-    if len(candidates) > 1:
-        found = ", ".join(item["market_ids"]["home"] for item in candidates)
+
+def decide_main_line(rows, pairs):
+    """
+    ตัดสินจากผลสแกนว่าได้เส้นหลักไหม — แยกออกมาให้เห็นเกณฑ์ทั้งหมดในที่เดียว
+
+    เกณฑ์ครบทุกข้อถึงจะรับ:
+      ก. กลุ่มนั้นมี market id ที่อยู่ในสารบัญ AH พอดีสองตัว (= เหย้ากับเยือนของเส้นเดียวกัน)
+      ข. ทั้งสองฝั่ง mainLine=true (ฝั่งเดียวไม่พอ เดี๋ยวได้เส้นครึ่ง ๆ กลาง ๆ)
+         ธงอ่านจาก players["0"]["mainLine"] ของ outcome ตัวนั้นเอง ไม่มีธง = ไม่ใช่เส้นหลัก
+      ค. ทั้งสองฝั่งมีราคาจริงเป็นตัวเลข (ขาดฝั่งใดฝั่งหนึ่งเอาไปเทียบว่าใครต่อไม่ได้)
+      ง. ต้องเข้าเกณฑ์เส้นเดียว เจอหลายเส้น = ธงของเจ้านี้เชื่อไม่ได้ ถอยไปเส้นสำรอง
+
+    เลขเส้นอ่านจากฝั่งเหย้า (market id น้อยกว่า) เสมอ ตามที่ยืนยันจากของจริง
+    (1068 = AH -0.5 คู่กับ 1069, 1058 = AH -1.75 คู่กับ 1059)
+    """
+    accepted = [pair for pair in pairs if pair["flagged"] and pair["priced"]]
+    result = {"outcomes": rows, "pairs": pairs, "main": None, "stamps": []}
+
+    if len(accepted) > 1:
+        found = ", ".join(pair["home_id"] for pair in accepted)
         logger.warning("เจ้านี้ปักธง mainLine ไว้ %d เส้น (market %s) — ธงเชื่อไม่ได้ ถอยไปเส้นสำรอง",
-                       len(candidates), found)
-        return None
+                       len(accepted), found)
+        return dict(result, verdict="ambiguous")
 
-    chosen = candidates[0]
-    outcomes = chosen.pop("outcomes")
+    if not accepted:
+        if not rows:
+            return dict(result, verdict="no_ah_market")
+        if not pairs:
+            return dict(result, verdict="no_pair")
 
-    if stamps is not None:
-        for outcome in outcomes:
-            stamp = outcome_changed_at(outcome)
-            if stamp:
-                stamps.append(stamp)
+        flagged = [pair for pair in pairs if pair["flagged"]]
+        if flagged:
+            logger.info("เจอเส้นหลัก (market %s) แต่ราคาไม่ครบสองฝั่ง — ข้ามไปใช้เส้นสำรอง",
+                        ", ".join(pair["home_id"] for pair in flagged))
+            return dict(result, verdict="missing_price")
+
+        return dict(result, verdict="not_flagged")
+
+    pair = accepted[0]
+    handicap = pair["handicap"]
+
+    result["main"] = {
+        "home": pair["home"],
+        "away": pair["away"],
+        "handicap": handicap,
+        "line": abs(handicap),
+        "source": "mainline",
+        "market_ids": {"home": pair["home_id"], "away": pair["away_id"]},
+    }
+    result["stamps"] = [stamp for stamp in map(outcome_changed_at, pair["outcomes"]) if stamp]
 
     logger.info("เส้นหลักของเจ้านี้: handicap=%s (market %s/%s) ราคา %s / %s",
-                chosen["handicap"], chosen["market_ids"]["home"], chosen["market_ids"]["away"],
-                chosen["home"], chosen["away"])
-    return chosen
+                handicap, pair["home_id"], pair["away_id"], pair["home"], pair["away"])
+    return dict(result, verdict="mainline")
+
+
+def find_main_line(book_data, catalog, stamps=None):
+    """
+    เส้นแฮนดิแคปหลักที่ตลาดใช้จริงของเจ้ามือเจ้านี้ — ไม่เจอคืน None (ให้ปลายทาง fallback)
+    เป็นแค่หน้ากากบาง ๆ ของ scan_handicap_lines() ตรรกะจริงอยู่ที่นั่นที่เดียว
+    """
+    scan = scan_handicap_lines(book_data, catalog)
+
+    if stamps is not None:
+        stamps.extend(scan["stamps"])
+
+    return scan["main"]
 
 
 # เส้นตายตัวที่ใช้เป็นตัวสำรองเมื่อหา mainLine ไม่เจอ — เรียงตามลำดับที่อยากได้ก่อน
@@ -1129,7 +1188,13 @@ def distill_book(book_data, catalog=None):
         },
     }
 
-    book["handicap"] = find_main_line(book_data, catalog, stamps) or fallback_handicap(book)
+    # สแกนครั้งเดียว แล้วเก็บทั้งเส้นที่เลือกและเหตุผลไว้ด้วยกัน
+    # เหตุผลจะได้ไปโผล่ใน notes ตรงกับที่เครื่องมือ debug พิมพ์ ไม่เล่าคนละเรื่อง
+    scan = scan_handicap_lines(book_data, catalog)
+    stamps.extend(scan["stamps"])
+
+    book["handicap"] = scan["main"] or fallback_handicap(book)
+    book["handicap_verdict"] = scan["verdict"]
 
     book["changed_at"] = max(stamps) if stamps else None
     return book
@@ -1163,10 +1228,11 @@ def distill_odds(raw_odds, catalog=None):
             notes.append(f"{slug} ไม่มี market: {', '.join(missing)}")
 
         handicap = book.get("handicap")
+        reason = SCAN_VERDICTS.get(book.get("handicap_verdict"), "ไม่ทราบสาเหตุ")
         if handicap is None:
-            notes.append(f"{slug} ไม่มีเส้นแฮนดิแคปที่ใช้ได้เลย")
+            notes.append(f"{slug} ไม่มีเส้นแฮนดิแคปที่ใช้ได้เลย ({reason})")
         elif handicap.get("source") == "fallback":
-            notes.append(f"{slug} หาเส้นหลัก (mainLine) ไม่เจอ — ใช้เส้นตายตัวแทน")
+            notes.append(f"{slug} ไม่ได้ใช้เส้นหลัก: {reason} — ใช้เส้นตายตัวแทน")
 
     asian_found = [s for s in slugs if any(name in s.lower() for name in ASIAN_BOOKS)]
 

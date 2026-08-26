@@ -41,9 +41,8 @@ from odds_data import (
     build_market_index,
     distill_odds,
     is_simulated_fixture,
-    market_groups,
-    read_main_line_flag,
-    unwrap_outcome,
+    SCAN_VERDICTS,
+    scan_handicap_lines,
 )
 from api_football import fail
 
@@ -87,7 +86,7 @@ def report_index(book_odds):
     print("-" * 70)
 
     for wanted in PANEL_BOOKS:
-        slug = next((s for s in sorted(book_odds) if wanted in s.lower()), None)
+        slug = book_slug(book_odds, wanted)
         if slug is None:
             print(f"  {wanted:<12} ไม่มีเจ้านี้ในคู่นี้")
             continue
@@ -118,43 +117,70 @@ def offline_catalog():
     return dict(FALLBACK_AH_CATALOG)
 
 
-def report_main_lines(book_odds, catalog):
+def book_slug(book_odds, wanted):
+    """ชื่อ key ของเจ้ามือที่ต้องการในไฟล์ dump — ไม่มีคืน None"""
+    return next((s for s in sorted(book_odds) if wanted in s.lower()), None)
+
+
+def line_number(handicap):
+    """เลขเส้นแบบมีเครื่องหมาย ไว้พิมพ์ในรายงาน — เส้น 0 พิมพ์ "0" เฉย ๆ ไม่ใช่ "+0" """
+    return f"{handicap:+g}" if handicap else "0"
+
+
+def main_line_conclusions(book_odds, catalog):
     """
-    ไล่ดูว่าแต่ละเจ้าเปิดเส้นแฮนดิแคปอะไรบ้าง และปักธง mainLine ไว้ที่เส้นไหน
-    เป็นจุดที่ใช้ตรวจกับ response จริงได้ตรงที่สุดว่าเราอ่านธง mainLine ถูกไหม
+    ผลสแกนของทุกเจ้าในไฟล์ dump — {slug: ผลจาก scan_handicap_lines()}
+    ใช้ scan_handicap_lines ตัวเดียวกับที่ distill_book ใช้คำนวณ field "handicap"
+    รายงานกับผล JSON จึงมาจากการตัดสินใจครั้งเดียวกัน แยกกันไม่ได้อีกแล้ว
     """
-    print("-" * 70)
-    print("เส้นแฮนดิแคปที่แต่ละเจ้าเปิด และธง mainLine")
-    print("-" * 70)
+    conclusions = {}
 
     for wanted in PANEL_BOOKS:
-        slug = next((s for s in sorted(book_odds) if wanted in s.lower()), None)
+        slug = book_slug(book_odds, wanted)
+        if slug is not None:
+            conclusions[slug] = scan_handicap_lines(book_odds[slug], catalog)
+
+    return conclusions
+
+
+def report_main_lines(book_odds, catalog):
+    """
+    ไล่ดูว่าแต่ละเจ้าเปิดเส้นแฮนดิแคปอะไรบ้าง ปักธง mainLine ไว้ที่ไหน และสรุปว่าระบบใช้เส้นไหน
+    ทุกบรรทัดมาจากผลของ scan_handicap_lines() ล้วน ๆ ไม่มีการไล่สแกนซ้ำในนี้เลย
+    """
+    print("-" * 70)
+    print("เส้นแฮนดิแคปที่แต่ละเจ้าเปิด ธง mainLine และเส้นที่ระบบเลือกใช้")
+    print("-" * 70)
+
+    conclusions = main_line_conclusions(book_odds, catalog)
+
+    for wanted in PANEL_BOOKS:
+        slug = book_slug(book_odds, wanted)
         if slug is None:
             print(f"  {wanted:<12} ไม่มีเจ้านี้ในคู่นี้")
             continue
 
-        rows, flagged = [], []
-        for _, mapping in market_groups(book_odds[slug]):
-            for market_id, outcome in sorted(mapping.items()):
-                if market_id not in catalog:
-                    continue
-                flag = read_main_line_flag(unwrap_outcome(outcome))
-                mark = {True: "  <== mainLine", False: "", None: "  (ไม่มีฟิลด์ mainLine)"}[flag]
-                if flag is True:
-                    flagged.append(market_id)
-                value = catalog[market_id]
-                shown = f"{value:+g}" if value else "0"  # กัน "+0" ที่อ่านแล้วสะดุด
-                rows.append(f"  {'':<12} market {market_id} handicap {shown}{mark}")
-
+        scan = conclusions[slug]
+        rows = scan["outcomes"]
         print(f"  {slug:<12} AH markets ที่เจอ: {len(rows)}")
-        for row in rows or [f"  {'':<12} ไม่มีเส้นแฮนดิแคปที่อยู่ในสารบัญเลย"]:
-            print(row)
 
-        # เจ้ามือควรปักธงเส้นหลักแค่เส้นเดียว = 2 id (ฝั่งเหย้า + ฝั่งเยือน)
-        # มากกว่านั้นแปลว่าข้อมูลดิบเองปักธงหลายเส้น ไม่ใช่โค้ดอ่านผิด (อ่านจาก path เดียวแล้ว)
-        if len(flagged) > 2:
-            print(f"  {'':<12} [!] ปักธง mainLine ไว้ {len(flagged)} ช่อง ({', '.join(flagged)})"
-                  " — ในไฟล์ดิบเป็นแบบนี้จริง ไม่ใช่โค้ดเดาชั้นเอง")
+        for row in rows:
+            mark = {True: "  <== mainLine", False: "",
+                    None: "  (ไม่มีฟิลด์ mainLine)"}[row["flag"]]
+            price = row["price"] if row["price"] is not None else "ไม่มีราคา"
+            print(f"  {'':<12} market {row['market_id']}"
+                  f" handicap {line_number(row['handicap'])} ราคา {price}{mark}")
+
+        if not rows:
+            print(f"  {'':<12} ไม่มีเส้นแฮนดิแคปที่อยู่ในสารบัญเลย")
+
+        main = scan["main"]
+        if main is not None:
+            print(f"  {'':<12} สรุป: ใช้เส้นหลัก market {main['market_ids']['home']}"
+                  f" (เส้น {line_number(main['handicap'])})")
+        else:
+            print(f"  {'':<12} สรุป: ไม่ใช้เส้นหลัก — {SCAN_VERDICTS[scan['verdict']]}"
+                  " (ถอยไปเส้นสำรอง)")
 
 
 def report_leagues():
