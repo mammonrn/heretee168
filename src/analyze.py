@@ -19,6 +19,7 @@ Phase 3C — วิเคราะห์คู่บอลด้วย Claude AP
 import json
 import os
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import anthropic
@@ -41,6 +42,11 @@ PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "analyst_prom
 
 # แคชราคาต่อรองอายุสั้นกว่าบทวิเคราะห์มาก เพราะราคาขยับทั้งวัน (บทวิเคราะห์เก็บยาวได้)
 ODDS_CACHE_TTL = 20 * 60  # 20 นาที
+
+# ขอรายการคู่จาก OddsPapi เป็นช่วง ไม่ใช่วันเดียว
+# เหตุผล: ยิงด้วย from == to (วันเดียวเป๊ะ) ได้ผลลัพธ์แทบว่าง (เจอจริงบน VPS: 1 คู่)
+# ส่วนช่วงหลายวันได้ครบ (~700 คู่ / 3 วัน) จึงขอวันก่อนหน้าถึงวันถัดไปของวันเตะเสมอ
+ODDS_FIXTURE_WINDOW_DAYS = 1  # กว้างออกไปข้างละกี่วันจากวันเตะ
 
 # ฟิลด์ของ fixture ฝั่ง OddsPapi ที่ต้องใช้จับคู่ — ตัดที่เหลือทิ้งก่อนเก็บลงแคช
 ODDSPAPI_FIXTURE_FIELDS = ("fixtureId", "participant1Name", "participant2Name",
@@ -191,8 +197,26 @@ def trim_oddspapi_fixture(fixture):
     return {field: fixture.get(field) for field in ODDSPAPI_FIXTURE_FIELDS}
 
 
+def fixture_window(date_str, days=ODDS_FIXTURE_WINDOW_DAYS):
+    """
+    ขยายวันเตะเป็นช่วงวัน (ก่อนหน้า .. ถัดไป) สำหรับส่งเป็น from/to ให้ OddsPapi
+
+    ต้องกว้างกว่าหนึ่งวันเสมอ เพราะ from == to ได้ผลลัพธ์แทบว่างเปล่า
+    ถ้าแปลงวันที่ไม่ได้ ก็คืนค่าเดิมไปให้ปลายทางจัดการต่อ
+    """
+    try:
+        day = date.fromisoformat(date_str)
+    except (TypeError, ValueError):
+        return [date_str]
+
+    return [(day - timedelta(days=days)).isoformat(), (day + timedelta(days=days)).isoformat()]
+
+
 def load_oddspapi_fixtures(date_str, log):
-    """ดึงรายการคู่ของ OddsPapi ของวันนั้น โดยใช้แคชร่วมกันข้ามการวิเคราะห์หลายคู่"""
+    """
+    ดึงรายการคู่ของ OddsPapi รอบ ๆ วันที่แข่ง โดยใช้แคชร่วมกันข้ามการวิเคราะห์หลายคู่
+    cache key ยังผูกกับวันเตะเหมือนเดิม แค่ query ให้กว้างขึ้น (ดู fixture_window)
+    """
     cache_key = f"oddspapi_fixtures:{date_str}"
 
     cached = cache_db.get_odds(cache_key, ODDS_CACHE_TTL)
@@ -200,9 +224,11 @@ def load_oddspapi_fixtures(date_str, log):
         log(f"ใช้รายการคู่ของ OddsPapi จากแคช ({len(cached['payload'])} คู่)")
         return cached["payload"]
 
-    fixtures = [trim_oddspapi_fixture(f) for f in fetch_oddspapi_fixtures([date_str])]
+    window = fixture_window(date_str)
+    fixtures = [trim_oddspapi_fixture(f) for f in fetch_oddspapi_fixtures(window)]
     cache_db.save_odds(cache_key, fixtures)
-    log(f"ดึงรายการคู่ของ OddsPapi ใหม่ ({len(fixtures)} คู่) แล้วเก็บลงแคช")
+    log(f"ดึงรายการคู่ของ OddsPapi ใหม่ ({len(fixtures)} คู่ ช่วง {window[0]} ถึง {window[-1]})"
+        " แล้วเก็บลงแคช")
     return fixtures
 
 
