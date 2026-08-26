@@ -75,7 +75,6 @@ GREETING = (
 PICK_DAY = "เลือกวันที่ต้องการดูโปรแกรมครับ 👇"
 PICK_LEAGUE = "เลือกลีกครับ 👇"
 PICK_MATCH = "เลือกคู่ที่อยากให้เฮียตี๋วิเคราะห์ครับ 👇"
-CHECKING_MATCHES = "⏳ เฮียตี๋กำลังดูว่าคู่ไหนคนสนใจเยอะ รอแป๊บ..."
 NO_POPULAR_MATCHES = (
     "ลีกนี้วันนี้มีแต่คู่เล็ก ๆ ที่คนไม่ค่อยตามครับ เฮียเลยไม่เอามาให้เลือก 🙏\n"
     "ลองดูลีกอื่นหรือวันอื่นได้เลย"
@@ -471,15 +470,12 @@ async def league_handler(update, context):
 
     header = f"{league['name_th']} — {day_label(date_str, snapshot['dates'])}"
 
-    # เช็คความนิยมของแต่ละคู่ (ยิง OddsPapi) เป็นงานบล็อกและใช้เวลา จึงบอกผู้ใช้ก่อนแล้วโยนไปเธรดแยก
-    await safe_edit(query, f"{header}\n{CHECKING_MATCHES}", None)
+    # กรองด้วยรายชื่อทีมดังในเครื่อง (data/popular_teams.json) — ไม่ยิง API จึงตอบได้ทันที
+    popular, stats = filter_popular_matches(matches, date_str, league.get("name_en"), logger.info)
 
-    popular, stats = await asyncio.to_thread(
-        filter_popular_matches, matches, date_str, league.get("name_en"), logger.info)
-
-    logger.info("ลีก %s วัน %s: แสดง %d จาก %d คู่ (ซ่อน %d, ยังไม่เช็ค %d, fallback=%s)",
+    logger.info("ลีก %s วัน %s: แสดง %d จาก %d คู่ (ซ่อน %d, fallback=%s)",
                 league.get("name_en"), date_str, len(popular), stats["total"],
-                stats["hidden"], stats["unchecked"], stats["fallback"])
+                stats["hidden"], stats["fallback"])
 
     if not popular:
         await safe_edit(query, f"{header}\n{NO_POPULAR_MATCHES}", home_keyboard())

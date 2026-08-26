@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 import cache_db
 from api_football import fail, get_api_key
 from match_data import CountingClient, collect_match_data
-from odds_data import fetch_oddspapi_fixtures, get_match_odds
+from odds_data import fetch_oddspapi_fixtures, get_match_odds, normalize_name
 
 # โมเดลที่ใช้วิเคราะห์ — แก้ตรงนี้จุดเดียวถ้าจะเปลี่ยนรุ่น
 MODEL = "claude-sonnet-4-6"
@@ -56,14 +56,9 @@ ODDSPAPI_FIXTURE_FIELDS = ("fixtureId", "participant1Name", "participant2Name",
 SHARP_BOOK_FOR_PROMPT = "pinnacle"
 
 # ---- การกรองคู่บอลตามความนิยม ----
-# ใช้จำนวนเจ้ามือที่ให้ราคา (total_books) เป็นตัวชี้วัด: คู่ดังเจ้ามือรับเยอะ คู่ไม่มีคนสนใจรับน้อย
-# หมายเหตุ: ค่า 20 นี้ตั้งจากการเดา ยังไม่ได้ปรับจากข้อมูลจริง
-# ดูค่าจริงของแต่ละคู่ได้จาก log "ความนิยม" แล้วค่อยปรับตัวเลขนี้ทีหลัง
-MIN_POPULARITY_BOOKS = 20
-
-# เพดานจำนวนคู่ที่ยอมยิง /odds ต่อการกดเลือกลีกหนึ่งครั้ง (กันโควตาพุ่งถ้าลีกมีคู่เยอะ)
-# คู่ที่เกินเพดานจะไม่ถูกเช็ค และ "ไม่ถูกซ่อน" — ยอมให้คู่ที่ยังไม่รู้ความนิยมโผล่ดีกว่าซ่อนคู่ดังทิ้ง
-MAX_ODDS_CHECKS_PER_LEAGUE = 20
+# ใช้ "รายชื่อทีมดัง" ที่เราคัดไว้เอง (data/popular_teams.json) ไม่ยิง API ใด ๆ ทั้งสิ้น
+# เดิมเคยเช็คจากจำนวนเจ้ามือของ OddsPapi แต่กินโควตาเร็วเกินไป (~11-20 requests ต่อการกดลีกครั้งเดียว)
+POPULAR_TEAMS_PATH = Path(__file__).resolve().parent.parent / "data" / "popular_teams.json"
 
 USER_INSTRUCTION = (
     "นี่คือข้อมูลของคู่บอลที่จะเตะ วิเคราะห์คู่นี้ตามสไตล์ของเฮียตี๋ "
@@ -338,94 +333,92 @@ def summarize_odds_for_prompt(odds):
     }
 
 
-def match_popularity(fixture_id, home, away, kickoff, league_hint, fixtures, log):
-    """
-    ความนิยมของคู่นี้ = จำนวนเจ้ามือที่ให้ราคา (total_books)
-    จับคู่กับ OddsPapi ไม่ได้ / มีปัญหาใด ๆ ให้ถือว่า 0 (ไม่นิยม) ไม่ throw
-    ผลถูกแคชต่อคู่ + วันที่ TTL เดียวกับราคา
-    """
-    date_str = (kickoff or "")[:10]
-    cache_key = f"popularity:{fixture_id}:{date_str}"
+_popular_teams_cache = {"path": None, "names": None}
 
-    cached = cache_db.get_odds(cache_key, ODDS_CACHE_TTL)
-    if cached is not None:
-        return cached["payload"].get("total_books", 0), True
 
+def load_popular_teams(path=POPULAR_TEAMS_PATH, log=lambda message: None):
+    """
+    อ่านรายชื่อทีมดังจาก data/popular_teams.json แล้วคืนเป็น set ของชื่อที่ normalize แล้ว
+    อ่านครั้งเดียวแล้วจำไว้ (แก้ไฟล์แล้วต้องรีสตาร์ทบอท ตามที่เขียนไว้ใน _readme ของไฟล์)
+
+    ไฟล์หาย / JSON เสีย -> คืน set ว่าง แล้วปล่อยให้ตัวกรองแสดงทุกคู่ (fail-open)
+    ดีกว่าซ่อนคู่บอลทั้งหมดเพราะไฟล์ config มีปัญหา
+    """
+    if _popular_teams_cache["path"] == str(path) and _popular_teams_cache["names"] is not None:
+        return _popular_teams_cache["names"]
+
+    names = set()
     try:
-        odds = get_match_odds(home, away, kickoff, league_hint, fixtures)
-    except SystemExit as exc:
-        log(f"[เตือน] เช็คความนิยมของ {home} vs {away} ไม่สำเร็จ (exit code={exc.code}) — นับเป็น 0")
-        return 0, False
-    except Exception as exc:
-        log(f"[เตือน] เช็คความนิยมของ {home} vs {away} ไม่สำเร็จ ({exc}) — นับเป็น 0")
-        return 0, False
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        groups = data.get("teams", data) if isinstance(data, dict) else {}
 
-    total = (odds or {}).get("total_books") or 0
-    cache_db.save_odds(cache_key, {"total_books": total})
-    return total, False
+        for key, value in (groups or {}).items():
+            if str(key).startswith("_") or not isinstance(value, list):
+                continue  # ข้ามคีย์อธิบาย เช่น _readme
+            for team in value:
+                normalized = normalize_name(team)
+                if normalized:
+                    names.add(normalized)
+    except FileNotFoundError:
+        log(f"[เตือน] ไม่พบไฟล์รายชื่อทีมดัง: {path} — จะแสดงคู่บอลทั้งหมดไปก่อน")
+    except (OSError, ValueError) as exc:
+        log(f"[เตือน] อ่านไฟล์รายชื่อทีมดังไม่ได้ ({exc}) — จะแสดงคู่บอลทั้งหมดไปก่อน")
+
+    _popular_teams_cache.update(path=str(path), names=names)
+    return names
 
 
-def filter_popular_matches(matches, date_str, league_hint=None, log=lambda message: None,
-                           min_books=MIN_POPULARITY_BOOKS, max_checks=MAX_ODDS_CHECKS_PER_LEAGUE):
+def is_popular_team(team_name, popular_names):
     """
-    คัดเฉพาะคู่ที่ "มีคนสนใจ" ออกมาแสดง โดยดูจากจำนวนเจ้ามือที่ให้ราคา
+    ทีมนี้อยู่ในรายชื่อทีมดังไหม — เทียบแบบ normalize (ตัด FC/AC/CF, ไม่สนตัวพิมพ์)
+    ใช้ normalize_name ตัวเดียวกับที่ใช้จับคู่กับ OddsPapi เพื่อให้พฤติกรรมสอดคล้องกัน
+
+    เทียบแบบ "ตรงกันเป๊ะหลัง normalize" เท่านั้น ไม่ใช้ containment
+    เพราะ containment จะทำให้ "England" ไปแมตช์ "New England Revolution" ได้
+    ทีมที่สะกดได้หลายแบบให้ใส่ทุกแบบไว้ในไฟล์รายชื่อแทน
+    """
+    return normalize_name(team_name) in popular_names
+
+
+def filter_popular_matches(matches, date_str=None, league_hint=None, log=lambda message: None,
+                           popular_names=None):
+    """
+    คัดเฉพาะคู่ที่มีทีมดังอย่างน้อยหนึ่งทีม — ใช้รายชื่อที่คัดไว้เอง ไม่ยิง API ใด ๆ เลย
 
     matches เป็น list ของ (เวลาเตะ, ทีมเหย้า, ทีมเยือน, fixture_id) ตามที่ fetch_fixtures จัดมา
-    คืน (คู่ที่เหลือ, สถิติ) — สถิติมี total/kept/hidden/unchecked/checked ไว้ log และเทสต์
+    คืน (คู่ที่เหลือ, สถิติ) — สถิติมี total/kept/hidden/fallback ไว้ log และเทสต์
 
-    fail-open: ถ้าระบบราคาล่มทั้งยวง (ดึงรายการคู่ไม่ได้) จะคืนคู่ทั้งหมดตามเดิม
-    ยอมโชว์เกินดีกว่าโชว์หน้าว่างเพราะของเสริมพัง
+    fail-open: ถ้าโหลดรายชื่อไม่ได้เลย จะคืนคู่ทั้งหมด (โชว์เกินดีกว่าโชว์หน้าว่าง)
+    date_str / league_hint ไม่ได้ใช้ตัดสินแล้ว เก็บไว้เพื่อความเข้ากันได้กับผู้เรียกเดิมและใช้ใน log
     """
     matches = list(matches or [])
-    stats = {"total": len(matches), "kept": 0, "hidden": 0, "unchecked": 0,
-             "checked": 0, "from_cache": 0, "fallback": False}
+    stats = {"total": len(matches), "kept": 0, "hidden": 0, "fallback": False}
 
     if not matches:
         return [], stats
 
-    try:
-        cache_db.init_db()
-        fixtures = load_oddspapi_fixtures(date_str, log)
-    except SystemExit as exc:
-        log(f"[เตือน] ดึงรายการคู่ของ OddsPapi ไม่ได้ (exit code={exc.code}) — แสดงทุกคู่ตามเดิม")
+    names = load_popular_teams(log=log) if popular_names is None else popular_names
+
+    if not names:
         stats.update(fallback=True, kept=len(matches))
-        return matches, stats
-    except Exception as exc:
-        log(f"[เตือน] ดึงรายการคู่ของ OddsPapi ไม่ได้ ({exc}) — แสดงทุกคู่ตามเดิม")
-        stats.update(fallback=True, kept=len(matches))
+        log(f"ไม่มีรายชื่อทีมดังให้ใช้ — แสดงทุกคู่ตามเดิม ({len(matches)} คู่)")
         return matches, stats
 
     kept = []
-    for index, match in enumerate(matches):
-        kickoff, home, away, fixture_id = match
+    for match in matches:
+        _, home, away, _ = match
 
-        if index >= max_checks:
-            stats["unchecked"] += 1
-            kept.append(match)
-            continue
-
-        popularity, from_cache = match_popularity(
-            fixture_id, home, away, f"{date_str}T{kickoff}:00+07:00", league_hint, fixtures, log)
-        stats["checked"] += 1
-        stats["from_cache"] += 1 if from_cache else 0
-
-        if popularity >= min_books:
+        if is_popular_team(home, names) or is_popular_team(away, names):
             kept.append(match)
             stats["kept"] += 1
         else:
             stats["hidden"] += 1
+            # พิมพ์ชื่อเต็มไว้ให้ก๊อปไปเติมใน data/popular_teams.json ได้ทันทีถ้าอยากให้โชว์
+            log(f"ซ่อน: {home} vs {away} (ไม่มีทีมดังในคู่นี้)")
 
-        log(f"ความนิยม: {home} vs {away} = {popularity} เจ้า"
-            f" -> {'แสดง' if popularity >= min_books else 'ซ่อน'}"
-            f"{' (จากแคช)' if from_cache else ''}")
-
-    if stats["unchecked"]:
-        log(f"[เตือน] ลีกนี้มี {stats['total']} คู่ เกินเพดาน {max_checks} คู่ต่อครั้ง"
-            f" — {stats['unchecked']} คู่ท้ายยังไม่ได้เช็คความนิยม (แสดงไว้ก่อน)")
-
-    log(f"สรุปการกรอง: แสดง {len(kept)} คู่ จากทั้งหมด {stats['total']} คู่"
-        f" (ซ่อน {stats['hidden']}, ยังไม่เช็ค {stats['unchecked']},"
-        f" ยิง OddsPapi ใหม่ {stats['checked'] - stats['from_cache']} ครั้ง)")
+    log(f"กรองด้วยรายชื่อทีมดัง (ไม่ได้ยิง OddsPapi): แสดง {len(kept)} คู่"
+        f" จากทั้งหมด {stats['total']} คู่ (ซ่อน {stats['hidden']})"
+        f"{' | ลีก ' + league_hint if league_hint else ''}")
 
     return kept, stats
 

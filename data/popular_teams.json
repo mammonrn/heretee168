@@ -1,0 +1,96 @@
+{
+  "_readme": [
+    "ไฟล์นี้คือ 'รายชื่อทีมดัง' ที่บอทจะเอามาแสดงในเมนูเลือกคู่",
+    "กติกา: คู่ไหนมีทีมใดทีมหนึ่งอยู่ในรายการนี้ = แสดง, ไม่มีเลย = ซ่อน",
+    "",
+    "วิธีเพิ่มทีมใหม่ (ไม่ต้องเขียนโปรแกรมเป็นก็ทำได้):",
+    "1. หาชื่อทีมให้ตรงกับที่บอทเห็น — ดูจาก log ของบอทตอนมันซ่อนคู่นั้น",
+    "   จะมีบรรทัดแบบ: ซ่อน: Bodo/Glimt vs NEC Nijmegen (ไม่มีทีมดังในคู่นี้)",
+    "   ให้ก๊อปชื่อทีมจากบรรทัดนั้นมาเลย จะได้ตรงเป๊ะแน่นอน",
+    "2. เปิดหมวดที่เหมาะสมข้างล่าง (เช่น england, thailand) แล้วเพิ่มชื่อต่อท้าย",
+    "   อย่าลืมใส่เครื่องหมายคำพูด \"\" ครอบชื่อ และใส่ลูกน้ำ , คั่นระหว่างชื่อ",
+    "   ชื่อสุดท้ายของแต่ละหมวดห้ามมีลูกน้ำต่อท้าย",
+    "3. บันทึกไฟล์ แล้วรีสตาร์ทบอท (pm2 restart heretee-bot)",
+    "",
+    "หมายเหตุ:",
+    "- ตัวพิมพ์เล็ก/ใหญ่ และคำอย่าง FC, AC, CF ไม่มีผล ระบบตัดให้เองอยู่แล้ว",
+    "- ชื่อต้องตรงกัน ไม่ใช่แค่คล้าย เช่น ใส่ 'Bayern' เฉย ๆ จะไม่แมตช์กับ 'Bayern Munich'",
+    "  ทีมไหนสะกดได้หลายแบบ ให้ใส่ทุกแบบไปเลย (ดูตัวอย่าง Bayern / Inter ข้างล่าง)",
+    "- เพิ่มหมวดใหม่เองได้ ตั้งชื่อหมวดเป็นอะไรก็ได้ ระบบอ่านทุกหมวดรวมกัน",
+    "- คีย์ที่ขึ้นต้นด้วย _ (เช่น _readme นี้) ระบบจะข้ามให้ ไม่ถือเป็นรายชื่อทีม"
+  ],
+
+  "teams": {
+    "england": [
+      "Arsenal", "Chelsea", "Liverpool", "Manchester City", "Manchester United",
+      "Tottenham", "Tottenham Hotspur", "Newcastle", "Newcastle United",
+      "Aston Villa", "West Ham", "West Ham United", "Everton", "Leeds", "Leeds United",
+      "Nottingham Forest", "Brighton", "Crystal Palace", "Wolverhampton Wanderers"
+    ],
+
+    "spain": [
+      "Real Madrid", "Barcelona", "FC Barcelona", "Atletico Madrid", "Atlético Madrid",
+      "Sevilla", "Valencia", "Villarreal", "Athletic Club", "Athletic Bilbao",
+      "Real Sociedad", "Real Betis", "Betis"
+    ],
+
+    "germany": [
+      "Bayern Munich", "Bayern München", "FC Bayern München",
+      "Borussia Dortmund", "Dortmund", "Bayer Leverkusen", "RB Leipzig",
+      "Eintracht Frankfurt", "Borussia Monchengladbach", "Borussia Mönchengladbach",
+      "VfB Stuttgart", "Stuttgart", "Schalke 04", "Werder Bremen", "Hamburger SV"
+    ],
+
+    "italy": [
+      "Juventus", "AC Milan", "Milan", "Inter", "Internazionale", "Inter Milan",
+      "Napoli", "Roma", "AS Roma", "Lazio", "Atalanta", "Fiorentina"
+    ],
+
+    "france": [
+      "Paris Saint Germain", "Paris Saint-Germain", "PSG",
+      "Marseille", "Olympique Marseille", "Lyon", "Olympique Lyonnais",
+      "Monaco", "AS Monaco", "Lille", "Nice", "OGC Nice"
+    ],
+
+    "europe_others": [
+      "Benfica", "Porto", "FC Porto", "Sporting CP", "Sporting Lisbon",
+      "Ajax", "PSV Eindhoven", "PSV", "Feyenoord",
+      "Celtic", "Rangers", "Galatasaray", "Fenerbahce", "Fenerbahçe", "Besiktas", "Beşiktaş"
+    ],
+
+    "thailand_clubs": [
+      "Buriram United", "BG Pathum United", "Muangthong United", "Port FC", "Port",
+      "Bangkok United", "Chonburi", "Ratchaburi", "Nakhon Ratchasima", "Chiangrai United",
+      "Police Tero", "Lamphun Warrior", "Sukhothai"
+    ],
+
+    "asia_clubs": [
+      "Urawa Reds", "Urawa Red Diamonds", "Kawasaki Frontale", "Vissel Kobe",
+      "Yokohama F. Marinos", "Yokohama F Marinos", "Gamba Osaka", "Cerezo Osaka",
+      "Kashima Antlers", "FC Tokyo", "Sanfrecce Hiroshima",
+      "Ulsan Hyundai", "Ulsan HD", "Jeonbuk Motors", "Jeonbuk Hyundai Motors",
+      "Pohang Steelers", "FC Seoul",
+      "Al Hilal", "Al Nassr", "Al Ittihad", "Al Ahli", "Al Ain",
+      "Johor Darul Ta'zim", "Johor Darul Tazim", "Kaya FC", "Lion City Sailors",
+      "Shanghai Port", "Shanghai Shenhua", "Beijing Guoan"
+    ],
+
+    "asean_national": [
+      "Thailand", "Vietnam", "Indonesia", "Malaysia", "Singapore",
+      "Philippines", "Myanmar", "Laos", "Cambodia", "Timor-Leste", "Brunei"
+    ],
+
+    "asia_national": [
+      "Japan", "South Korea", "Korea Republic", "China", "China PR", "Australia",
+      "Saudi Arabia", "Iran", "Iraq", "Qatar", "United Arab Emirates", "Uzbekistan",
+      "Jordan", "India"
+    ],
+
+    "world_national": [
+      "Brazil", "Argentina", "France", "England", "Spain", "Germany", "Italy",
+      "Portugal", "Netherlands", "Belgium", "Croatia", "Uruguay", "Colombia",
+      "Mexico", "USA", "United States", "Morocco", "Senegal", "Nigeria", "Egypt",
+      "Denmark", "Switzerland", "Poland", "Scotland", "Wales", "Turkey", "Türkiye"
+    ]
+  }
+}
