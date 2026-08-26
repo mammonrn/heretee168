@@ -295,6 +295,50 @@ def fetch_odds_context(match_summary, log=lambda message: None):
         return None
 
 
+# ราคาต่อรองสองฝั่งที่ห่างกันน้อยกว่านี้ ถือว่าตลาดมองสูสี ไม่มีใครเป็นต่อชัด
+HANDICAP_LEVEL_GAP = 0.05
+
+
+def decimal_to_hk(price):
+    """
+    แปลงราคาทศนิยมเป็นราคาแบบที่คนไทยอ่านกัน
+      ทศนิยมต่ำกว่า 2.00  -> เลขบวก (ทศนิยม - 1)      เช่น 1.68 -> 0.68
+      ทศนิยม 2.00 ขึ้นไป  -> เลขลบ  (-1 / (ทศนิยม-1)) เช่น 2.13 -> -0.88
+    ค่าที่ใช้ไม่ได้ (None, ไม่ใช่ตัวเลข, หรือ <= 1.00) คืน None ให้ปลายทางข้ามไป
+    """
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    if price <= 1:
+        return None
+    if price < 2.0:
+        return round(price - 1, 2)
+    return round(-1 / (price - 1), 2)
+
+
+def convert_handicap(prices):
+    """แปลงราคาต่อรองทั้งฝั่งเหย้า-เยือนเป็นรูปแบบที่คนไทยอ่าน (ไม่แตะ 1x2)"""
+    if not isinstance(prices, dict):
+        return None
+    return {side: decimal_to_hk(value) for side, value in prices.items()}
+
+
+def handicap_favourite(book):
+    """
+    ฝั่งที่ตลาดถือหางตามราคาต่อรอง คิดจากราคาทศนิยมต้นทาง (ราคาต่ำกว่า = เป็นต่อ)
+    ต้องคิดก่อนแปลง เพราะหลังแปลงแล้วเลขบวก/ลบเรียงกันคนละทาง เทียบตรง ๆ ไม่ได้
+    คืน "home" / "away" / "level" (สูสี) หรือ None เมื่อไม่มีราคาต่อรองที่เทียบได้
+    """
+    for market in ("ah_-0.5", "ah_0"):
+        prices = book.get(market) or {}
+        home, away = prices.get("home"), prices.get("away")
+        if not all(isinstance(value, (int, float)) for value in (home, away)):
+            continue
+        if abs(home - away) < HANDICAP_LEVEL_GAP:
+            return "level"
+        return "home" if home < away else "away"
+    return None
+
+
 def summarize_odds_for_prompt(odds):
     """
     ย่อราคาที่กลั่นแล้วให้เหลือเท่าที่ AI ต้องใช้ — ไม่ยัดราคาทุกเจ้าเข้า prompt
@@ -325,9 +369,11 @@ def summarize_odds_for_prompt(odds):
     return {
         "source": "OddsPapi",
         "bookmaker": slug,
-        "1x2": one_x_two,
-        "ah_-0.5": book.get("ah_-0.5"),
-        "ah_0": book.get("ah_0"),
+        "1x2": one_x_two,                                   # ยังเป็นราคาทศนิยมตามเดิม
+        "ah_-0.5": convert_handicap(book.get("ah_-0.5")),   # แปลงเป็นราคาที่คนไทยอ่าน
+        "ah_0": convert_handicap(book.get("ah_0")),
+        "handicap_price_format": "thai",
+        "handicap_favourite": handicap_favourite(book),
         "market_favourite": favourite,
         "total_books": odds.get("total_books"),
         "updated_at": book.get("changed_at"),
