@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-from analyze import analyze_fixture
+from analyze import analyze_fixture, filter_popular_matches
 from api_football import fail, get_api_key
 from fetch_fixtures import (
     date_range,
@@ -75,6 +75,11 @@ GREETING = (
 PICK_DAY = "เลือกวันที่ต้องการดูโปรแกรมครับ 👇"
 PICK_LEAGUE = "เลือกลีกครับ 👇"
 PICK_MATCH = "เลือกคู่ที่อยากให้เฮียตี๋วิเคราะห์ครับ 👇"
+CHECKING_MATCHES = "⏳ เฮียตี๋กำลังดูว่าคู่ไหนคนสนใจเยอะ รอแป๊บ..."
+NO_POPULAR_MATCHES = (
+    "ลีกนี้วันนี้มีแต่คู่เล็ก ๆ ที่คนไม่ค่อยตามครับ เฮียเลยไม่เอามาให้เลือก 🙏\n"
+    "ลองดูลีกอื่นหรือวันอื่นได้เลย"
+)
 ANALYZING = "🔍 เฮียตี๋กำลังดูเกมนี้ให้ รอแป๊บ..."
 ERROR_MESSAGE = "ขออภัยครับ เฮียตี๋ดูเกมนี้ไม่ได้ตอนนี้ ลองใหม่อีกครั้ง 🙏"
 ONLY_BUTTONS = "กดเมนูด้านล่างเพื่อดูบทวิเคราะห์จากเฮียตี๋ได้เลยครับ 👇"
@@ -326,9 +331,13 @@ def league_keyboard(snapshot, date_str):
     return InlineKeyboardMarkup(buttons)
 
 
-def match_keyboard(snapshot, date_str, league_id):
-    """ปุ่มเลือกคู่บอลในลีกนั้น"""
-    _, matches = find_league(snapshot, date_str, league_id)
+def match_keyboard(snapshot, date_str, league_id, matches=None):
+    """
+    ปุ่มเลือกคู่บอลในลีกนั้น
+    ส่ง matches เข้ามาได้ถ้ากรองมาแล้ว (ไม่ส่งจะใช้ทุกคู่ใน snapshot)
+    """
+    if matches is None:
+        _, matches = find_league(snapshot, date_str, league_id)
     buttons = []
 
     for kickoff, home, away, fixture_id in (matches or [])[:MATCHES_PER_PAGE]:
@@ -460,10 +469,26 @@ async def league_handler(update, context):
         await safe_edit(query, STALE_MENU, None)
         return
 
+    header = f"{league['name_th']} — {day_label(date_str, snapshot['dates'])}"
+
+    # เช็คความนิยมของแต่ละคู่ (ยิง OddsPapi) เป็นงานบล็อกและใช้เวลา จึงบอกผู้ใช้ก่อนแล้วโยนไปเธรดแยก
+    await safe_edit(query, f"{header}\n{CHECKING_MATCHES}", None)
+
+    popular, stats = await asyncio.to_thread(
+        filter_popular_matches, matches, date_str, league.get("name_en"), logger.info)
+
+    logger.info("ลีก %s วัน %s: แสดง %d จาก %d คู่ (ซ่อน %d, ยังไม่เช็ค %d, fallback=%s)",
+                league.get("name_en"), date_str, len(popular), stats["total"],
+                stats["hidden"], stats["unchecked"], stats["fallback"])
+
+    if not popular:
+        await safe_edit(query, f"{header}\n{NO_POPULAR_MATCHES}", home_keyboard())
+        return
+
     await safe_edit(
         query,
-        f"{league['name_th']} — {day_label(date_str, snapshot['dates'])}\n{PICK_MATCH}",
-        match_keyboard(snapshot, date_str, league_id),
+        f"{header}\n{PICK_MATCH}",
+        match_keyboard(snapshot, date_str, league_id, matches=popular),
     )
 
 

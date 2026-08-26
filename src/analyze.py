@@ -55,6 +55,16 @@ ODDSPAPI_FIXTURE_FIELDS = ("fixtureId", "participant1Name", "participant2Name",
 # เจ้าที่ยกมาให้ AI ดูเป็นหลัก (เจ้าคมราคา) — ไม่ต้องยัดราคาทุกเจ้าเข้า prompt
 SHARP_BOOK_FOR_PROMPT = "pinnacle"
 
+# ---- การกรองคู่บอลตามความนิยม ----
+# ใช้จำนวนเจ้ามือที่ให้ราคา (total_books) เป็นตัวชี้วัด: คู่ดังเจ้ามือรับเยอะ คู่ไม่มีคนสนใจรับน้อย
+# หมายเหตุ: ค่า 20 นี้ตั้งจากการเดา ยังไม่ได้ปรับจากข้อมูลจริง
+# ดูค่าจริงของแต่ละคู่ได้จาก log "ความนิยม" แล้วค่อยปรับตัวเลขนี้ทีหลัง
+MIN_POPULARITY_BOOKS = 20
+
+# เพดานจำนวนคู่ที่ยอมยิง /odds ต่อการกดเลือกลีกหนึ่งครั้ง (กันโควตาพุ่งถ้าลีกมีคู่เยอะ)
+# คู่ที่เกินเพดานจะไม่ถูกเช็ค และ "ไม่ถูกซ่อน" — ยอมให้คู่ที่ยังไม่รู้ความนิยมโผล่ดีกว่าซ่อนคู่ดังทิ้ง
+MAX_ODDS_CHECKS_PER_LEAGUE = 20
+
 USER_INSTRUCTION = (
     "นี่คือข้อมูลของคู่บอลที่จะเตะ วิเคราะห์คู่นี้ตามสไตล์ของเฮียตี๋ "
     "แล้วฟันธงว่าทีมไหนได้เปรียบ พร้อมเหตุผลจากข้อมูลจริง\n\n"
@@ -326,6 +336,98 @@ def summarize_odds_for_prompt(odds):
         "total_books": odds.get("total_books"),
         "updated_at": book.get("changed_at"),
     }
+
+
+def match_popularity(fixture_id, home, away, kickoff, league_hint, fixtures, log):
+    """
+    ความนิยมของคู่นี้ = จำนวนเจ้ามือที่ให้ราคา (total_books)
+    จับคู่กับ OddsPapi ไม่ได้ / มีปัญหาใด ๆ ให้ถือว่า 0 (ไม่นิยม) ไม่ throw
+    ผลถูกแคชต่อคู่ + วันที่ TTL เดียวกับราคา
+    """
+    date_str = (kickoff or "")[:10]
+    cache_key = f"popularity:{fixture_id}:{date_str}"
+
+    cached = cache_db.get_odds(cache_key, ODDS_CACHE_TTL)
+    if cached is not None:
+        return cached["payload"].get("total_books", 0), True
+
+    try:
+        odds = get_match_odds(home, away, kickoff, league_hint, fixtures)
+    except SystemExit as exc:
+        log(f"[เตือน] เช็คความนิยมของ {home} vs {away} ไม่สำเร็จ (exit code={exc.code}) — นับเป็น 0")
+        return 0, False
+    except Exception as exc:
+        log(f"[เตือน] เช็คความนิยมของ {home} vs {away} ไม่สำเร็จ ({exc}) — นับเป็น 0")
+        return 0, False
+
+    total = (odds or {}).get("total_books") or 0
+    cache_db.save_odds(cache_key, {"total_books": total})
+    return total, False
+
+
+def filter_popular_matches(matches, date_str, league_hint=None, log=lambda message: None,
+                           min_books=MIN_POPULARITY_BOOKS, max_checks=MAX_ODDS_CHECKS_PER_LEAGUE):
+    """
+    คัดเฉพาะคู่ที่ "มีคนสนใจ" ออกมาแสดง โดยดูจากจำนวนเจ้ามือที่ให้ราคา
+
+    matches เป็น list ของ (เวลาเตะ, ทีมเหย้า, ทีมเยือน, fixture_id) ตามที่ fetch_fixtures จัดมา
+    คืน (คู่ที่เหลือ, สถิติ) — สถิติมี total/kept/hidden/unchecked/checked ไว้ log และเทสต์
+
+    fail-open: ถ้าระบบราคาล่มทั้งยวง (ดึงรายการคู่ไม่ได้) จะคืนคู่ทั้งหมดตามเดิม
+    ยอมโชว์เกินดีกว่าโชว์หน้าว่างเพราะของเสริมพัง
+    """
+    matches = list(matches or [])
+    stats = {"total": len(matches), "kept": 0, "hidden": 0, "unchecked": 0,
+             "checked": 0, "from_cache": 0, "fallback": False}
+
+    if not matches:
+        return [], stats
+
+    try:
+        cache_db.init_db()
+        fixtures = load_oddspapi_fixtures(date_str, log)
+    except SystemExit as exc:
+        log(f"[เตือน] ดึงรายการคู่ของ OddsPapi ไม่ได้ (exit code={exc.code}) — แสดงทุกคู่ตามเดิม")
+        stats.update(fallback=True, kept=len(matches))
+        return matches, stats
+    except Exception as exc:
+        log(f"[เตือน] ดึงรายการคู่ของ OddsPapi ไม่ได้ ({exc}) — แสดงทุกคู่ตามเดิม")
+        stats.update(fallback=True, kept=len(matches))
+        return matches, stats
+
+    kept = []
+    for index, match in enumerate(matches):
+        kickoff, home, away, fixture_id = match
+
+        if index >= max_checks:
+            stats["unchecked"] += 1
+            kept.append(match)
+            continue
+
+        popularity, from_cache = match_popularity(
+            fixture_id, home, away, f"{date_str}T{kickoff}:00+07:00", league_hint, fixtures, log)
+        stats["checked"] += 1
+        stats["from_cache"] += 1 if from_cache else 0
+
+        if popularity >= min_books:
+            kept.append(match)
+            stats["kept"] += 1
+        else:
+            stats["hidden"] += 1
+
+        log(f"ความนิยม: {home} vs {away} = {popularity} เจ้า"
+            f" -> {'แสดง' if popularity >= min_books else 'ซ่อน'}"
+            f"{' (จากแคช)' if from_cache else ''}")
+
+    if stats["unchecked"]:
+        log(f"[เตือน] ลีกนี้มี {stats['total']} คู่ เกินเพดาน {max_checks} คู่ต่อครั้ง"
+            f" — {stats['unchecked']} คู่ท้ายยังไม่ได้เช็คความนิยม (แสดงไว้ก่อน)")
+
+    log(f"สรุปการกรอง: แสดง {len(kept)} คู่ จากทั้งหมด {stats['total']} คู่"
+        f" (ซ่อน {stats['hidden']}, ยังไม่เช็ค {stats['unchecked']},"
+        f" ยิง OddsPapi ใหม่ {stats['checked'] - stats['from_cache']} ครั้ง)")
+
+    return kept, stats
 
 
 def analyze_fixture(fixture_id, fresh=False, log=lambda message: None):
