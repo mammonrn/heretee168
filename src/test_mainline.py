@@ -24,12 +24,16 @@ import odds_data
 
 def outcome(price, main_line=None, changed_at=None):
     """
-    outcome หนึ่งช่องตามโครงสร้างจริง: ราคาซ่อนอยู่ใน players["0"]["price"]
-    main_line=None แปลว่าไม่มีฟิลด์ mainLine เลย (จำลอง response รุ่นเก่า)
+    outcome หนึ่งช่องตามโครงสร้างจริงที่ยืนยันแล้ว:
+        {"players": {"0": {"price": ..., "mainLine": ...}}}
+    ทั้งราคาและธง mainLine อยู่ใน dict ใบเดียวกันคือ players["0"]
+    main_line=None แปลว่าไม่มีฟิลด์ mainLine เลย
     """
-    data = {"players": {"0": {"price": price}}}
+    player = {"price": price}
     if main_line is not None:
-        data["mainLine"] = main_line
+        player["mainLine"] = main_line
+
+    data = {"players": {"0": player}}
     if changed_at is not None:
         data["changedAt"] = changed_at
     return data
@@ -47,6 +51,7 @@ def book(markets):
 
 # สารบัญที่ใช้ในเทสต์ — เลียนของที่ /v4/markets ควรคืนมา (เฉพาะ AH)
 CATALOG = {
+    "1058": -1.75, "1059": 1.75,
     "1068": -0.5, "1069": 0.5,
     "1070": -0.25, "1071": 0.25,
     "1072": 0.0, "1073": 0.0,
@@ -176,6 +181,145 @@ class TestFetchMarketCatalog(unittest.TestCase):
         self.assertNotIn(odds_data.MARKET_CATALOG_CACHE_KEY, self.saved)
 
 
+# โครงสร้าง outcome จริงจาก raw response ของ pinnacle บน VPS (ยืนยันแล้ว)
+# ธง mainLine อยู่ระดับเดียวกับ price คือใน players["0"] และเส้นหลักจริงคือ -1.75 (market 1058)
+REAL_PINNACLE_MARKETS = {
+    "1058": {"outcomes": {
+        "1058": {"players": {"0": {"price": 1.917, "mainLine": True}}},
+        "1059": {"players": {"0": {"price": 1.97, "mainLine": True}}},
+    }},
+    "1068": {"outcomes": {
+        "1068": {"players": {"0": {"price": 1.30, "mainLine": False}}},
+        "1069": {"players": {"0": {"price": 3.45, "mainLine": False}}},
+    }},
+    "1072": {"outcomes": {
+        "1072": {"players": {"0": {"price": 1.15, "mainLine": False}}},
+        "1073": {"players": {"0": {"price": 5.20, "mainLine": False}}},
+    }},
+}
+
+
+class TestRealPinnacleSample(unittest.TestCase):
+    """
+    เคสหลัก: ข้อมูลจริงจาก VPS ที่เคยพัง — ต้องได้เส้น -1.75 และต้องไม่ fallback
+
+    เดิมพังสองชั้นพร้อมกัน:
+      1. market 1058 ไม่อยู่ในสารบัญสำรอง กลุ่มนี้เลยถูกข้ามตั้งแต่ก่อนดูธง mainLine
+      2. ธง mainLine อ่านแบบไล่เดาหลายชั้น ซึ่งมีชั้นที่ยืมค่าจาก outcome ตัวแรกของกลุ่ม
+    """
+
+    def test_finds_the_real_main_line_at_minus_one_seventy_five(self):
+        found = odds_data.find_main_line(book(REAL_PINNACLE_MARKETS), CATALOG)
+
+        self.assertIsNotNone(found, "ต้องเจอเส้นหลัก ไม่ใช่คืน None แล้วไป fallback")
+        self.assertEqual(found["source"], "mainline")
+        self.assertEqual(found["handicap"], -1.75)
+        self.assertEqual(found["line"], 1.75)
+        self.assertEqual(found["home"], 1.917)
+        self.assertEqual(found["away"], 1.97)
+        self.assertEqual(found["market_ids"], {"home": "1058", "away": "1059"})
+
+    def test_works_on_the_fallback_catalog_alone(self):
+        """แม้ /v4/markets ใช้ไม่ได้ สารบัญสำรองก็ต้องครอบ 1058 ถึงจะเจอเส้นนี้"""
+        found = odds_data.find_main_line(book(REAL_PINNACLE_MARKETS),
+                                         odds_data.FALLBACK_AH_CATALOG)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["handicap"], -1.75)
+
+    def test_reaches_the_prompt_as_the_line_that_gets_spoken(self):
+        raw = {"pinnacle": book(REAL_PINNACLE_MARKETS)}
+        summary = analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, CATALOG))
+
+        self.assertEqual(summary["handicap"]["line"], "1.75")
+        self.assertEqual(summary["handicap"]["line_label"], "ลูกครึ่งควบสอง [1.5-2]")
+        self.assertEqual(summary["handicap"]["source"], "mainline")
+        self.assertEqual(summary["handicap"]["giver"], "home")
+        self.assertEqual(summary["handicap_favourite"], "home")
+
+    def test_the_flag_sits_beside_the_price_not_above_it(self):
+        outcome = REAL_PINNACLE_MARKETS["1058"]["outcomes"]["1058"]
+
+        self.assertTrue(odds_data.main_line_flag(outcome))
+        self.assertEqual(odds_data.main_line_player(outcome)["price"], 1.917)
+        # ธงไม่ได้อยู่ระดับ outcome — ยืนยันว่าเราไม่ได้อ่านจากชั้นนั้น
+        self.assertNotIn("mainLine", outcome)
+
+
+class TestFallbackCatalogCoverage(unittest.TestCase):
+    """สารบัญสำรองต้องครอบช่วงที่ยืนยันแล้ว และต้องไม่เดาเลยขอบออกไป"""
+
+    def test_covers_every_confirmed_market_id(self):
+        confirmed = {"1058": -1.75, "1068": -0.5, "1070": -0.25,
+                     "1072": 0.0, "1074": 0.25, "1076": 0.5}
+        for market_id, handicap in confirmed.items():
+            self.assertEqual(odds_data.FALLBACK_AH_CATALOG.get(market_id), handicap,
+                             f"market {market_id} ต้องเป็นเส้น {handicap}")
+
+    def test_pairs_every_home_id_with_the_next_id(self):
+        for market_id, handicap in odds_data.FALLBACK_AH_CATALOG.items():
+            if int(market_id) % 2 == 0:
+                self.assertIn(str(int(market_id) + 1), odds_data.FALLBACK_AH_CATALOG,
+                              f"ฝั่งเหย้า {market_id} ต้องมีฝั่งเยือนคู่กัน")
+
+    def test_does_not_guess_past_the_confirmed_range(self):
+        """เดาเลยขอบแล้วไปชนกับ id ของตลาดสูง-ต่ำ จะรายงานเส้นสูง-ต่ำเป็นแฮนดิแคป"""
+        ids = [int(market_id) for market_id in odds_data.FALLBACK_AH_CATALOG]
+
+        self.assertEqual(min(ids), 1058)   # -1.75 คือขอบล่างที่ยืนยันแล้ว
+        self.assertEqual(max(ids), 1077)   # +0.5 (ฝั่งเยือน) คือขอบบนที่ยืนยันแล้ว
+        self.assertNotIn(str(odds_data.MARKET_OU25_OVER), odds_data.FALLBACK_AH_CATALOG)
+        self.assertNotIn(str(odds_data.MARKET_OU25_UNDER), odds_data.FALLBACK_AH_CATALOG)
+
+
+class TestMainLineFlagIsStrict(unittest.TestCase):
+    """
+    ธงต้องอ่านจาก players ของ outcome ตัวนั้นเอง และไม่มีธง = ไม่ใช่เส้นหลัก
+
+    เคส singbet/singbet-b ที่ทุกเส้นขึ้นเป็นเส้นหลักพร้อมกันหมด (เป็นไปไม่ได้จริง)
+    มาจากการอ่านธงแบบไล่เดาหลายชั้น เทสต์กลุ่มนี้ล็อกไม่ให้กลับมาอีก
+    """
+
+    def test_missing_flag_defaults_to_not_main_line(self):
+        self.assertIs(odds_data.main_line_flag(outcome(1.90)), False)
+        self.assertIsNone(odds_data.read_main_line_flag(outcome(1.90)))
+
+    def test_a_whole_book_without_flags_finds_no_main_line(self):
+        data = book({str(1058 + n * 2): group((1058 + n * 2, outcome(1.90)),
+                                              (1059 + n * 2, outcome(1.92)))
+                     for n in range(5)})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_a_sibling_flag_does_not_leak_onto_the_others(self):
+        """เส้นเดียวถูกปักธง เส้นอื่นในกลุ่มอื่นต้องไม่ติดธงตามไปด้วย"""
+        data = book({
+            "1058": group((1058, outcome(1.91, True)), (1059, outcome(1.97, True))),
+            "1068": group((1068, outcome(1.30)), (1069, outcome(3.45))),
+            "1072": group((1072, outcome(1.15)), (1073, outcome(5.20))),
+        })
+        flagged = [market_id
+                   for _, mapping in odds_data.market_groups(data)
+                   for market_id, value in mapping.items()
+                   if odds_data.main_line_flag(value)]
+
+        self.assertEqual(sorted(flagged), ["1058", "1059"])
+
+    def test_a_flag_on_the_group_above_is_not_borrowed(self):
+        """ธงที่ระดับกลุ่มไม่ใช่ path จริง ห้ามเอามาตัดสินแทน players"""
+        data = {"markets": {"1058": {
+            "mainLine": True,
+            "outcomes": {
+                "1058": outcome(1.91, False),
+                "1059": outcome(1.97, False),
+            },
+        }}}
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_a_false_flag_stays_false(self):
+        self.assertIs(odds_data.main_line_flag(outcome(1.90, False)), False)
+        self.assertIs(odds_data.read_main_line_flag(outcome(1.90, False)), False)
+
+
 class TestFindMainLine(unittest.TestCase):
     """สแกน AH ทุกเส้นที่เจ้ามือเสนอ แล้วหยิบเส้นที่ mainLine=true ทั้งสองฝั่ง"""
 
@@ -231,13 +375,25 @@ class TestFindMainLine(unittest.TestCase):
         self.assertEqual(found["handicap"], 0.0)
         self.assertEqual(found["source"], "mainline")
 
-    def test_picks_the_lowest_market_id_when_more_than_one_is_flagged(self):
+    def test_refuses_to_pick_when_more_than_one_line_is_flagged(self):
+        """เจ้ามือมีเส้นหลักได้เส้นเดียว เจอหลายเส้นแปลว่าธงเชื่อไม่ได้ ต้องถอยไปเส้นสำรอง"""
         data = book({
             "1090": group((1090, outcome(2.30, True)), (1091, outcome(1.62, True))),
             "1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, True))),
         })
-        found = odds_data.find_main_line(data, CATALOG)
-        self.assertEqual(found["market_ids"]["home"], "1080")
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_a_book_that_flags_every_line_falls_back(self):
+        """เคส singbet ที่รายงานมา: ปักธงทุกเส้น ต้องไม่หยิบเส้นไหนมาพูดว่าเป็นเส้นหลัก"""
+        raw = {"singbet": book({
+            "1058": group((1058, outcome(1.90, True)), (1059, outcome(1.90, True))),
+            "1068": group((1068, outcome(1.30, True)), (1069, outcome(3.45, True))),
+            "1072": group((1072, outcome(1.15, True)), (1073, outcome(5.20, True))),
+        })}
+        handicap = odds_data.distill_odds(raw, CATALOG)["books"]["singbet"]["handicap"]
+
+        self.assertEqual(handicap["source"], "fallback")
+        self.assertEqual(handicap["handicap"], -0.5)   # ถอยไปเส้นตายตัวเดิม
 
     def test_reads_the_flag_from_string_and_number_forms(self):
         for raw in (True, "true", "True", 1):
@@ -245,7 +401,7 @@ class TestFindMainLine(unittest.TestCase):
             self.assertIsNotNone(odds_data.find_main_line(data, CATALOG),
                                  f"ควรอ่าน mainLine={raw!r} เป็นจริงได้")
 
-    def test_reads_the_flag_when_it_sits_on_the_player_level(self):
+    def test_reads_the_flag_from_the_player_level(self):
         data = book({"1080": {"outcomes": {
             "1080": {"players": {"0": {"price": 2.02, "mainLine": True}}},
             "1081": {"players": {"0": {"price": 1.84, "mainLine": True}}},
@@ -254,6 +410,14 @@ class TestFindMainLine(unittest.TestCase):
 
         self.assertIsNotNone(found)
         self.assertEqual(found["handicap"], -0.75)
+
+    def test_a_flag_at_the_outcome_level_is_ignored(self):
+        """ระดับ outcome ไม่ใช่ path จริง อ่านจากตรงนั้นเคยทำให้ได้ผลลัพธ์มั่ว"""
+        data = book({"1080": {"outcomes": {
+            "1080": {"mainLine": True, "players": {"0": {"price": 2.02}}},
+            "1081": {"mainLine": True, "players": {"0": {"price": 1.84}}},
+        }}})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
 
     def test_collects_changed_at_stamps_of_the_chosen_line(self):
         data = book({"1080": group((1080, outcome(2.02, True, "2026-08-26T10:00:00Z")),

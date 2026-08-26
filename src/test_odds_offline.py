@@ -14,7 +14,8 @@
 รายงานจะบอกด้วยว่าแต่ละเจ้าเปิดเส้นแฮนดิแคปอะไรบ้าง และปักธง mainLine ไว้เส้นไหน
 ใช้ตรวจกับ response จริงได้ว่าเราอ่านธง mainLine ถูกที่ถูกชั้นหรือเปล่า
 สารบัญ market อ่านจาก cache.db ถ้ามี ไม่มีก็ใช้ตัวสำรองในโค้ด — ไม่ยิง API ทั้งสองทาง
-(ตัวสำรองมีแค่เส้น -0.5 ถึง +0.5 เส้นอื่นจะไม่ถูกมองว่าเป็น AH จนกว่าจะมีสารบัญจริงในแคช)
+(ตัวสำรองครอบแค่ช่วงที่ยืนยันแล้ว -1.75 ถึง +0.5 เส้นนอกช่วงนี้จะไม่ถูกมองว่าเป็น AH
+ จนกว่าจะมีสารบัญจริงจาก /v4/markets ในแคช)
 """
 
 import json
@@ -40,8 +41,9 @@ from odds_data import (
     build_market_index,
     distill_odds,
     is_simulated_fixture,
-    main_line_flag,
     market_groups,
+    read_main_line_flag,
+    unwrap_outcome,
 )
 from api_football import fail
 
@@ -131,13 +133,15 @@ def report_main_lines(book_odds, catalog):
             print(f"  {wanted:<12} ไม่มีเจ้านี้ในคู่นี้")
             continue
 
-        rows = []
+        rows, flagged = [], []
         for _, mapping in market_groups(book_odds[slug]):
             for market_id, outcome in sorted(mapping.items()):
                 if market_id not in catalog:
                     continue
-                flag = main_line_flag(outcome)
+                flag = read_main_line_flag(unwrap_outcome(outcome))
                 mark = {True: "  <== mainLine", False: "", None: "  (ไม่มีฟิลด์ mainLine)"}[flag]
+                if flag is True:
+                    flagged.append(market_id)
                 value = catalog[market_id]
                 shown = f"{value:+g}" if value else "0"  # กัน "+0" ที่อ่านแล้วสะดุด
                 rows.append(f"  {'':<12} market {market_id} handicap {shown}{mark}")
@@ -145,6 +149,12 @@ def report_main_lines(book_odds, catalog):
         print(f"  {slug:<12} AH markets ที่เจอ: {len(rows)}")
         for row in rows or [f"  {'':<12} ไม่มีเส้นแฮนดิแคปที่อยู่ในสารบัญเลย"]:
             print(row)
+
+        # เจ้ามือควรปักธงเส้นหลักแค่เส้นเดียว = 2 id (ฝั่งเหย้า + ฝั่งเยือน)
+        # มากกว่านั้นแปลว่าข้อมูลดิบเองปักธงหลายเส้น ไม่ใช่โค้ดอ่านผิด (อ่านจาก path เดียวแล้ว)
+        if len(flagged) > 2:
+            print(f"  {'':<12} [!] ปักธง mainLine ไว้ {len(flagged)} ช่อง ({', '.join(flagged)})"
+                  " — ในไฟล์ดิบเป็นแบบนี้จริง ไม่ใช่โค้ดเดาชั้นเอง")
 
 
 def report_leagues():

@@ -68,19 +68,40 @@ AH_NAME_BLOCKERS = ("european", "3-way", "3 way", "three way", "corner", "card",
                     "half", "1st", "2nd", "first ", "second ", "period", "extra time",
                     "overtime", "penalt", "shot", "foul", "offside")
 
-# สารบัญสำรอง ใช้เมื่อ /v4/markets เรียกไม่ได้ (โควตาหมด/เน็ตล่ม/โครงสร้างเปลี่ยน)
-# ค่าที่ยืนยันแล้วจากของจริง: 1068 = AH -0.5, 1070 = AH -0.25, 1072 = AH 0,
-#                            1074 = AH +0.25, 1076 = AH +0.5  (ทั้งหมดเป็นตัวเลขฝั่งเหย้า)
-# ส่วน id เลขคี่คือฝั่งเยือนของคู่เดียวกัน (1068 คู่กับ 1069 ตามที่เห็นใน raw response จริง)
-# ค่า handicap ของฝั่งเยือนในตารางนี้ใส่แบบกลับเครื่องหมายไว้เฉย ๆ ยังไม่เคยยืนยันกับของจริง
-# แต่ไม่กระทบผลลัพธ์ เพราะเลขเส้นที่เอาไปแสดงอ่านจากฝั่งเหย้าเสมอ (ดู find_main_line)
-FALLBACK_AH_CATALOG = {
-    "1068": -0.5, "1069": 0.5,
-    "1070": -0.25, "1071": 0.25,
-    "1072": 0.0, "1073": 0.0,
-    "1074": 0.25, "1075": -0.25,
-    "1076": 0.5, "1077": -0.5,
-}
+# ---- สารบัญสำรอง ใช้เมื่อ /v4/markets เรียกไม่ได้ (โควตาหมด/เน็ตล่ม/โครงสร้างเปลี่ยน) ----
+# market id ฝั่งเหย้าเรียงเป็นเส้นตรงตามเลขเส้น ยืนยันจากของจริงแล้ว 6 จุด:
+#   1058 = -1.75, 1068 = -0.5, 1070 = -0.25, 1072 = 0, 1074 = +0.25, 1076 = +0.5
+# ได้สูตร: market id ฝั่งเหย้า = 1072 + 8 x handicap   (ทีละ 0.25 ลูก = ห่างกัน 2 id)
+# ฝั่งเยือนคือ id ฝั่งเหย้า + 1 (1068 คู่กับ 1069, 1058 คู่กับ 1059 — เห็นในของจริงทั้งคู่)
+AH_MARKET_ID_AT_ZERO = MARKET_AH_0_HOME   # 1072 = เส้น 0
+AH_MARKET_IDS_PER_GOAL = 8                # 1 ลูก = 8 id (0.25 ลูก = 2 id)
+
+# ยืดสารบัญสำรองได้แค่ "ในช่วงที่ยืนยันแล้ว" เท่านั้น คือ -1.75 ถึง +0.5
+# ห้ามเดาเลยขอบนี้เด็ดขาด: market id ข้างเคียงเป็นตลาดอื่น (สูง-ต่ำ 2.5 = 1010/1011)
+# และเรายังไม่รู้ว่าช่วงของ AH เริ่ม-จบตรงไหน ถ้าเดาเลยไปแล้วดันตรงกับ id ของตลาดสูง-ต่ำ
+# ระบบจะรายงานเส้นสูง-ต่ำเป็นเส้นแฮนดิแคป = ข้อมูลผิดที่แย่กว่าการถอยไป fallback มาก
+# เส้นที่อยู่นอกช่วงนี้จะเจอก็ต่อเมื่อ /v4/markets ใช้ได้จริง (ซึ่งเป็นทางหลักอยู่แล้ว)
+FALLBACK_AH_RANGE = (-1.75, 0.5)
+
+
+def build_fallback_catalog(lowest, highest):
+    """
+    สร้างสารบัญสำรองจากสูตร market id ข้างบน ทีละ 0.25 ลูกตลอดช่วงที่ยืนยันแล้ว
+    ค่าของฝั่งเยือนใส่แบบกลับเครื่องหมาย — ยังไม่เคยยืนยันกับของจริง แต่ไม่กระทบผลลัพธ์
+    เพราะเลขเส้นที่เอาไปแสดงอ่านจากฝั่งเหย้าเสมอ (ดู find_main_line)
+    """
+    catalog = {}
+
+    for step in range(round((highest - lowest) / 0.25) + 1):
+        handicap = round(lowest + step * 0.25, 2)
+        home_id = AH_MARKET_ID_AT_ZERO + round(handicap * AH_MARKET_IDS_PER_GOAL)
+        catalog[str(home_id)] = handicap
+        catalog[str(home_id + 1)] = -handicap if handicap else 0.0  # กัน -0.0 ที่อ่านแล้วสะดุด
+
+    return catalog
+
+
+FALLBACK_AH_CATALOG = build_fallback_catalog(*FALLBACK_AH_RANGE)
 
 # เจ้ามือที่สนใจ — แก้ตรงนี้จุดเดียวถ้าอยากเพิ่ม/ลด
 ASIAN_BOOKS = ("sbobet", "singbet", "singbet-b")
@@ -877,33 +898,44 @@ def flag_from_dict(data):
     return None
 
 
+def main_line_player(outcome):
+    """
+    ตัว player ของ outcome นี้ — ที่เดียวกับที่ outcome_price ไปหยิบราคา
+    หยิบ players["0"] ก่อนเสมอ ไม่มีค่อยใช้คีย์แรกที่เรียงแล้ว (ลอกลำดับจาก outcome_price เป๊ะ ๆ)
+    """
+    if not isinstance(outcome, dict):
+        return None
+
+    players = outcome.get("players")
+    if not isinstance(players, dict) or not players:
+        return None
+
+    player = players.get("0") or players.get(0) or players[sorted(players, key=str)[0]]
+    return player if isinstance(player, dict) else None
+
+
+def read_main_line_flag(outcome):
+    """
+    ค่า mainLine ของ outcome นี้ — True/False ตามที่ API บอก, None เมื่อไม่มีฟิลด์นี้เลย
+    (แยกสามสถานะไว้ให้เครื่องมือ debug ใช้ ส่วนตอนตัดสินใจจริงใช้ main_line_flag)
+
+    ตำแหน่งจริงยืนยันจาก raw response แล้วว่าอยู่ระดับเดียวกับ price เป๊ะ ๆ:
+        markets[market_id]["outcomes"][outcome_id]["players"]["0"]["mainLine"]
+    จึงอ่านจาก path เดียวกับราคา ไม่ไล่เดาชั้นอื่นอีกแล้ว
+
+    ที่ต้องอ่านให้ตรง path เดียว: ของเดิมไล่หาหลายชั้น และมีชั้นที่ "แกะลงไปตัวลูกตัวแรก"
+    ซึ่งทำให้ outcome พี่น้องในกลุ่มเดียวกันได้ค่าธงของตัวแรกไปทั้งกลุ่ม
+    ผลคือทุกเส้นขึ้นเป็นเส้นหลักพร้อมกันหมด ซึ่งเป็นไปไม่ได้จริง
+    """
+    return flag_from_dict(main_line_player(outcome))
+
+
 def main_line_flag(outcome):
     """
-    outcome นี้เป็นเส้นหลักไหม — คืน True/False ตามที่ API บอก, None เมื่อไม่มีฟิลด์ mainLine เลย
-
-    ไล่หาสามชั้น (ระดับ outcome -> ระดับที่แกะ outcomes แล้ว -> ในแต่ละ player)
-    เพราะยืนยันมาแค่ว่า "ทุก outcome มีฟิลด์ mainLine" แต่ยังไม่ได้ยืนยันว่าอยู่ชั้นไหนแน่
+    เส้นนี้เป็นเส้นหลักไหม — คืน True/False เท่านั้น
+    ไม่มีฟิลด์ mainLine ให้ดู ถือว่า "ไม่ใช่เส้นหลัก" (default False) ไม่ใช่เดาว่าใช่
     """
-    direct = flag_from_dict(outcome)
-    if direct is not None:
-        return direct
-
-    inner = unwrap_outcome(outcome)
-    if inner is not outcome:
-        nested = flag_from_dict(inner)
-        if nested is not None:
-            return nested
-    else:
-        inner = outcome
-
-    players = inner.get("players") if isinstance(inner, dict) else None
-    if isinstance(players, dict):
-        for player in players.values():
-            value = flag_from_dict(player)
-            if value is not None:
-                return value
-
-    return None
+    return read_main_line_flag(outcome) is True
 
 
 def market_groups(book_data):
@@ -955,10 +987,12 @@ def find_main_line(book_data, catalog, stamps=None):
     เกณฑ์ครบทุกข้อถึงจะรับ:
       ก. กลุ่มนั้นมี market id ที่อยู่ในสารบัญ AH พอดีสองตัว (= ฝั่งเหย้ากับฝั่งเยือนของเส้นเดียวกัน)
       ข. ทั้งสองฝั่ง mainLine=true (ฝั่งเดียวไม่พอ เดี๋ยวได้เส้นครึ่ง ๆ กลาง ๆ)
+         ธงอ่านจาก players["0"]["mainLine"] ของ outcome ตัวนั้นเอง ไม่มีธง = ไม่ใช่เส้นหลัก
       ค. ทั้งสองฝั่งมีราคาจริงเป็นตัวเลข (ขาดฝั่งใดฝั่งหนึ่งเอาไปเทียบว่าใครต่อไม่ได้)
 
     เลขเส้นอ่านจากฝั่งเหย้า (market id น้อยกว่า) เสมอ ตามที่ยืนยันจากของจริง
-    (1068 = AH -0.5 คู่กับ 1069, 1072 = AH 0 คู่กับ 1073)
+    (1068 = AH -0.5 คู่กับ 1069, 1058 = AH -1.75 คู่กับ 1059)
+    ถ้าเจอเส้นที่เข้าเกณฑ์มากกว่าหนึ่งเส้น ถือว่าธงของเจ้านี้เชื่อไม่ได้ แล้วคืน None
 
     คืน dict ของเส้นหลัก หรือ None ถ้าไม่เจอ (ให้ปลายทาง fallback ไปเส้นตายตัว)
     """
@@ -971,13 +1005,18 @@ def find_main_line(book_data, catalog, stamps=None):
             continue
 
         home_id, away_id = sorted(ah_ids, key=market_id_sort_key)
-        home_outcome, away_outcome = mapping[home_id], mapping[away_id]
+
+        # แกะชั้นครั้งเดียวแล้วใช้ตัวเดียวกันทั้งอ่านธงและอ่านราคา
+        # ธง mainLine กับ price อยู่ใน dict ใบเดียวกัน จึงต้องมาจาก object เดียวกันเสมอ
+        # (ถ้าแยกกันแกะ มีโอกาสที่ธงมาจาก outcome หนึ่งแต่ราคามาจากอีก outcome หนึ่ง)
+        home_outcome = unwrap_outcome(mapping[home_id])
+        away_outcome = unwrap_outcome(mapping[away_id])
 
         if not (main_line_flag(home_outcome) and main_line_flag(away_outcome)):
             continue
 
-        home_price = outcome_price(unwrap_outcome(home_outcome))
-        away_price = outcome_price(unwrap_outcome(away_outcome))
+        home_price = outcome_price(home_outcome)
+        away_price = outcome_price(away_outcome)
         numeric = [isinstance(value, (int, float)) and not isinstance(value, bool)
                    for value in (home_price, away_price)]
         if not all(numeric):
@@ -999,16 +1038,22 @@ def find_main_line(book_data, catalog, stamps=None):
     if not candidates:
         return None
 
+    # เจ้ามือหนึ่งเจ้าต้องมีเส้นหลักเส้นเดียว เจอมากกว่านั้นแปลว่าธงของเจ้านี้เชื่อไม่ได้
+    # (เคยเจอจริง: บางเจ้าปักธงไว้ทุกเส้น) จะเลือกเส้นไหนก็เป็นการเดาทั้งนั้น
+    # จึงถอยไปใช้เส้นตายตัวแทน ซึ่งติดป้าย fallback ไว้ ปลายทางจะไม่ไปพูดว่านี่คือเส้นที่ตลาดตั้ง
+    # ยอมได้เส้นสำรอง ดีกว่าหยิบเส้นมั่ว ๆ มาพูดว่าเป็นเส้นหลัก
     if len(candidates) > 1:
         found = ", ".join(item["market_ids"]["home"] for item in candidates)
-        logger.warning("เจอเส้นหลักมากกว่าหนึ่งเส้น (market %s) — เลือกอันแรกตาม market id", found)
+        logger.warning("เจ้านี้ปักธง mainLine ไว้ %d เส้น (market %s) — ธงเชื่อไม่ได้ ถอยไปเส้นสำรอง",
+                       len(candidates), found)
+        return None
 
-    chosen = min(candidates, key=lambda item: market_id_sort_key(item["market_ids"]["home"]))
+    chosen = candidates[0]
     outcomes = chosen.pop("outcomes")
 
     if stamps is not None:
         for outcome in outcomes:
-            stamp = outcome_changed_at(outcome) or outcome_changed_at(unwrap_outcome(outcome))
+            stamp = outcome_changed_at(outcome)
             if stamp:
                 stamps.append(stamp)
 
