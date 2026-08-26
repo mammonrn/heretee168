@@ -26,6 +26,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import cache_db
 from api_football import fail, get_bangkok_tz
 
 # เปิด ODDS_DEBUG_DUMP=1 เพื่อเซฟ raw response ของ /odds ลงไฟล์
@@ -159,7 +160,23 @@ def api_get(endpoint, params, api_key=None, counter=None):
             if value and not data.get("data") and not data.get("fixtures"):
                 fail(f"[ERROR] OddsPapi แจ้งข้อผิดพลาดกลับมา ({key}): {value}")
 
+    log_quota_usage(endpoint)
     return data
+
+
+def log_quota_usage(endpoint):
+    """
+    บันทึกและ log จำนวน request ที่ยิงไป OddsPapi (free tier 250 ครั้ง/เดือน)
+    ไม่ได้บังคับ rate limit — แค่ให้เห็นตัวเลขใน log ว่าใช้ไปเท่าไรแล้ว
+    ถ้าเขียน db ไม่ได้ก็แค่ข้าม ไม่ให้กระทบการทำงานหลัก
+    """
+    try:
+        cache_db.init_db()
+        today, month = cache_db.record_odds_request()
+        logger.info("โควตา OddsPapi: /%s | วันนี้ %d ครั้ง | เดือนนี้ %d ครั้ง (free tier 250/เดือน)",
+                    endpoint, today, month)
+    except Exception as exc:  # ตัวนับพังไม่ควรทำให้การดึงราคาพังไปด้วย
+        logger.warning("บันทึกตัวนับ request ของ OddsPapi ไม่สำเร็จ (%s)", exc)
 
 
 def as_list(payload, *keys):

@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 import cache_db
 from api_football import fail, get_api_key
 from match_data import CountingClient, collect_match_data
+from odds_data import fetch_oddspapi_fixtures, get_match_odds
 
 # โมเดลที่ใช้วิเคราะห์ — แก้ตรงนี้จุดเดียวถ้าจะเปลี่ยนรุ่น
 MODEL = "claude-sonnet-4-6"
@@ -37,6 +38,16 @@ TRUNCATED_NOTE = "(หมายเหตุ: บทวิเคราะห์�
 
 # path อ้างอิงจากตำแหน่งไฟล์ .py แบบเดียวกับ leagues.json — รันจากที่ไหนก็เจอ
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "analyst_prompt.txt"
+
+# แคชราคาต่อรองอายุสั้นกว่าบทวิเคราะห์มาก เพราะราคาขยับทั้งวัน (บทวิเคราะห์เก็บยาวได้)
+ODDS_CACHE_TTL = 20 * 60  # 20 นาที
+
+# ฟิลด์ของ fixture ฝั่ง OddsPapi ที่ต้องใช้จับคู่ — ตัดที่เหลือทิ้งก่อนเก็บลงแคช
+ODDSPAPI_FIXTURE_FIELDS = ("fixtureId", "participant1Name", "participant2Name",
+                           "startTime", "tournamentName", "categoryName", "hasOdds")
+
+# เจ้าที่ยกมาให้ AI ดูเป็นหลัก (เจ้าคมราคา) — ไม่ต้องยัดราคาทุกเจ้าเข้า prompt
+SHARP_BOOK_FOR_PROMPT = "pinnacle"
 
 USER_INSTRUCTION = (
     "นี่คือข้อมูลของคู่บอลที่จะเตะ วิเคราะห์คู่นี้ตามสไตล์ของเฮียตี๋ "
@@ -111,19 +122,25 @@ def get_anthropic_key():
     return api_key
 
 
-def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
+def analyze_match(match_summary, api_key, system_prompt, model=MODEL, odds_summary=None):
     """
     ส่งข้อมูลคู่บอลเข้า Claude แล้วคืน (บทวิเคราะห์, ถูกตัดเพราะชนเพดานหรือไม่)
+    odds_summary ใส่เพิ่มได้เมื่อมีราคาจริง — ไม่มีก็ไม่ต้องส่งอะไรเข้า prompt เลย
     """
     client = anthropic.Anthropic(api_key=api_key)
     match_json = json.dumps(match_summary, ensure_ascii=False, indent=2)
+
+    user_content = USER_INSTRUCTION + match_json
+    if odds_summary:
+        user_content += ("\n\nราคาต่อรองจากตลาด (ข้อมูลประกอบเท่านั้น ห้ามชวนแทงหรือพูดถึงราคาในเชิงแนะนำ):\n"
+                         + json.dumps(odds_summary, ensure_ascii=False, indent=2))
 
     try:
         response = client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
             system=system_prompt,
-            messages=[{"role": "user", "content": USER_INSTRUCTION + match_json}],
+            messages=[{"role": "user", "content": user_content}],
         )
     except anthropic.AuthenticationError:
         fail(
@@ -169,6 +186,122 @@ def analyze_match(match_summary, api_key, system_prompt, model=MODEL):
     return text, response.stop_reason == "max_tokens"
 
 
+def trim_oddspapi_fixture(fixture):
+    """เก็บเฉพาะฟิลด์ที่ใช้จับคู่ ก่อนเอาลงแคช (ผลดิบมีหลายร้อยคู่ ไม่ต้องเก็บทั้งก้อน)"""
+    return {field: fixture.get(field) for field in ODDSPAPI_FIXTURE_FIELDS}
+
+
+def load_oddspapi_fixtures(date_str, log):
+    """ดึงรายการคู่ของ OddsPapi ของวันนั้น โดยใช้แคชร่วมกันข้ามการวิเคราะห์หลายคู่"""
+    cache_key = f"oddspapi_fixtures:{date_str}"
+
+    cached = cache_db.get_odds(cache_key, ODDS_CACHE_TTL)
+    if cached is not None:
+        log(f"ใช้รายการคู่ของ OddsPapi จากแคช ({len(cached['payload'])} คู่)")
+        return cached["payload"]
+
+    fixtures = [trim_oddspapi_fixture(f) for f in fetch_oddspapi_fixtures([date_str])]
+    cache_db.save_odds(cache_key, fixtures)
+    log(f"ดึงรายการคู่ของ OddsPapi ใหม่ ({len(fixtures)} คู่) แล้วเก็บลงแคช")
+    return fixtures
+
+
+def fetch_odds_context(match_summary, log=lambda message: None):
+    """
+    หาราคาต่อรองของคู่นี้มาเป็นข้อมูลประกอบ — คืน dict หรือ None
+
+    fail-open เสมอ: จับคู่ไม่ได้ / OddsPapi ล่ม / โควตาหมด / timeout ให้คืน None เงียบ ๆ
+    บทวิเคราะห์ต้องออกได้ตามปกติเหมือนไม่มีราคาเลย เพราะ odds เป็นของเสริมไม่ใช่ของหลัก
+    (odds_data ใช้ fail() ที่เรียก sys.exit จึงต้องดัก SystemExit ด้วย ไม่ใช่แค่ Exception)
+    """
+    match = match_summary.get("match") or {}
+    home = (match_summary.get("home") or {}).get("name")
+    away = (match_summary.get("away") or {}).get("name")
+    kickoff = match.get("kickoff")
+    fixture_id = match_summary.get("fixture_id")
+
+    if not home or not away:
+        return None
+
+    date_str = (kickoff or "")[:10]
+    if not date_str:
+        log("ไม่มีเวลาเตะในข้อมูล จึงข้ามการดึงราคา")
+        return None
+
+    cache_key = f"odds:{fixture_id}:{date_str}"
+
+    try:
+        cache_db.init_db()
+
+        cached = cache_db.get_odds(cache_key, ODDS_CACHE_TTL)
+        if cached is not None:
+            payload = cached["payload"]
+            if not payload.get("found"):
+                log("แคชบอกว่าคู่นี้จับกับ OddsPapi ไม่ได้ — ข้ามราคาไป (ไม่ยิง API ซ้ำ)")
+                return None
+            log(f"ใช้ราคาจากแคช (ดึงเมื่อ {cached['created_at']})")
+            return payload.get("odds")
+
+        fixtures = load_oddspapi_fixtures(date_str, log)
+        odds = get_match_odds(home, away, kickoff, match.get("league"), fixtures)
+
+        # เก็บผลลัพธ์ลงแคชทั้งกรณีเจอและไม่เจอ กรณีไม่เจอจะได้ไม่ยิงซ้ำจนหมดโควตา
+        cache_db.save_odds(cache_key, {"found": odds is not None, "odds": odds})
+
+        if odds is None:
+            log("จับคู่กับ OddsPapi ไม่ได้ — วิเคราะห์ต่อโดยไม่มีราคา")
+        else:
+            log(f"ได้ราคาจาก {len(odds.get('books') or {})} เจ้า")
+
+        return odds
+
+    except SystemExit as exc:
+        log(f"[เตือน] ดึงราคาไม่สำเร็จ (exit code={exc.code}) — วิเคราะห์ต่อโดยไม่มีราคา")
+        return None
+    except Exception as exc:
+        log(f"[เตือน] ดึงราคาไม่สำเร็จ ({exc}) — วิเคราะห์ต่อโดยไม่มีราคา")
+        return None
+
+
+def summarize_odds_for_prompt(odds):
+    """
+    ย่อราคาที่กลั่นแล้วให้เหลือเท่าที่ AI ต้องใช้ — ไม่ยัดราคาทุกเจ้าเข้า prompt
+    เลือกเจ้าคมราคา (pinnacle) ถ้ามี ไม่มีก็ใช้เจ้าแรกที่มีข้อมูล แล้วบอกด้วยว่าใครเป็นต่อในสายตาตลาด
+    """
+    books = (odds or {}).get("books") or {}
+    if not books:
+        return None
+
+    def has_price(book):
+        return any(value is not None
+                   for market, prices in book.items() if isinstance(prices, dict)
+                   for value in prices.values())
+
+    slug = next((s for s in books if SHARP_BOOK_FOR_PROMPT in s.lower() and has_price(books[s])), None)
+    if slug is None:
+        slug = next((s for s in books if has_price(books[s])), None)
+    if slug is None:
+        return None
+
+    book = books[slug]
+    one_x_two = book.get("1x2") or {}
+
+    # ราคาต่ำสุดของ 1X2 = ฝั่งที่ตลาดมองว่าได้เปรียบที่สุด
+    priced = {side: value for side, value in one_x_two.items() if isinstance(value, (int, float))}
+    favourite = min(priced, key=priced.get) if priced else None
+
+    return {
+        "source": "OddsPapi",
+        "bookmaker": slug,
+        "1x2": one_x_two,
+        "ah_-0.5": book.get("ah_-0.5"),
+        "ah_0": book.get("ah_0"),
+        "market_favourite": favourite,
+        "total_books": odds.get("total_books"),
+        "updated_at": book.get("changed_at"),
+    }
+
+
 def analyze_fixture(fixture_id, fresh=False, log=lambda message: None):
     """
     หัวใจของการวิเคราะห์หนึ่งคู่ ใช้ร่วมกันทั้ง CLI และบอท Telegram (ไม่ print เอง)
@@ -204,8 +337,13 @@ def analyze_fixture(fixture_id, fresh=False, log=lambda message: None):
     log(f"ดึงข้อมูลครบ (ยิง API-SPORTS ไป {client.request_count} ครั้ง)")
 
     match_name = (match_summary.get("match") or {}).get("name") or f"fixture {fixture_id}"
+
+    # ราคาต่อรองเป็นของเสริม — ล้มเหลวเมื่อไรก็วิเคราะห์ต่อโดยไม่มีมัน
+    odds_summary = summarize_odds_for_prompt(fetch_odds_context(match_summary, log))
+
     log(f"กำลังให้เฮียตี๋วิเคราะห์ {match_name} ด้วย {MODEL} ...")
-    analysis, truncated = analyze_match(match_summary, anthropic_key, system_prompt)
+    analysis, truncated = analyze_match(match_summary, anthropic_key, system_prompt,
+                                        odds_summary=odds_summary)
 
     created_at = cache_db.save_analysis(fixture_id, match_name, analysis, MODEL)
 
