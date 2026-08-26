@@ -184,6 +184,23 @@ class TestFetchMarketCatalog(unittest.TestCase):
         self.assertNotIn(odds_data.MARKET_CATALOG_CACHE_KEY, self.saved)
 
 
+# raw response จริงของ pinnacle บน VPS — คัดลอกมาทั้งก้อน ไม่ได้ย่อ
+# top-level key "1058" คือ "กลุ่มของเส้น -1.75 ทั้งเส้น" ข้างในมีทั้งฝั่งเหย้า (1058)
+# และฝั่งเยือน (1059) เป็น sibling กัน แบบเดียวกับ 1068/1069 ที่ทำงานถูกมาตั้งแต่ Phase 5A
+REAL_PINNACLE_GROUP_1058 = {
+    "outcomes": {
+        "1058": {"players": {"0": {"price": 1.917, "mainLine": True,
+                                   "bookmakerOutcomeId": "-1.75/home"}}},
+        "1059": {"players": {"0": {"price": 1.97, "mainLine": True,
+                                   "bookmakerOutcomeId": "-1.75/away"}}},
+    }
+}
+
+# สารบัญที่ /v4/markets ส่งกลับมาจริงบน VPS — มีแต่ id ฝั่งเหย้า ไม่มี 1059
+# เคสนี้แหละที่เคยทำให้ได้ verdict "no_pair" เพราะโค้ดบังคับว่าฝั่งเยือนต้องอยู่ในสารบัญด้วย
+REAL_CATALOG_HOME_ONLY = {"1058": -1.75, "1068": -0.5, "1070": -0.25,
+                          "1072": 0.0, "1074": 0.25, "1076": 0.5}
+
 # โครงสร้าง outcome จริงจาก raw response ของ pinnacle บน VPS (ยืนยันแล้ว)
 # ธง mainLine อยู่ระดับเดียวกับ price คือใน players["0"] และเส้นหลักจริงคือ -1.75 (market 1058)
 REAL_PINNACLE_MARKETS = {
@@ -240,6 +257,40 @@ class TestRealPinnacleSample(unittest.TestCase):
         self.assertEqual(summary["handicap"]["giver"], "home")
         self.assertEqual(summary["handicap_favourite"], "home")
 
+    def test_the_exact_raw_group_from_the_vps(self):
+        """ก้อนข้อมูลจริงตรง ๆ กับสารบัญจริงที่มีแต่ฝั่งเหย้า — ต้องได้ -1.75 ไม่ fallback"""
+        scan = odds_data.scan_handicap_lines(
+            {"markets": {"1058": REAL_PINNACLE_GROUP_1058}}, REAL_CATALOG_HOME_ONLY)
+
+        self.assertEqual(scan["verdict"], "mainline")
+        self.assertEqual(scan["main"]["handicap"], -1.75)
+        self.assertEqual(scan["main"]["home"], 1.917)
+        self.assertEqual(scan["main"]["away"], 1.97)
+        self.assertEqual(scan["main"]["market_ids"], {"home": "1058", "away": "1059"})
+
+    def test_the_away_side_need_not_be_in_the_catalog(self):
+        """สารบัญใช้แค่แปลง id ฝั่งเหย้าเป็นเลขเส้น ฝั่งเยือนหาจาก id + 1 ในข้อมูลราคา"""
+        self.assertNotIn("1059", REAL_CATALOG_HOME_ONLY)
+
+        raw = {"pinnacle": {"markets": {"1058": REAL_PINNACLE_GROUP_1058}}}
+        book_data = odds_data.distill_odds(raw, REAL_CATALOG_HOME_ONLY)["books"]["pinnacle"]
+
+        self.assertEqual(book_data["handicap_verdict"], "mainline")
+        self.assertEqual(book_data["handicap"]["handicap"], -1.75)
+        self.assertEqual(book_data["handicap"]["source"], "mainline")
+
+    def test_an_away_only_catalog_entry_is_not_read_as_a_home_side(self):
+        """สารบัญมีทั้ง 1058 และ 1059 ต้องไม่ทำให้ 1059 ไปจับกับ 1060 กลายเป็นคนละเส้น"""
+        data = book({
+            "1058": REAL_PINNACLE_GROUP_1058,
+            "1060": group((1060, outcome(1.80, False)), (1061, outcome(2.10, False))),
+        })
+        scan = odds_data.scan_handicap_lines(data, odds_data.FALLBACK_AH_CATALOG)
+
+        self.assertEqual([(pair["home_id"], pair["away_id"]) for pair in scan["pairs"]],
+                         [("1058", "1059"), ("1060", "1061")])
+        self.assertEqual(scan["main"]["handicap"], -1.75)
+
     def test_the_flag_sits_beside_the_price_not_above_it(self):
         outcome = REAL_PINNACLE_MARKETS["1058"]["outcomes"]["1058"]
 
@@ -267,9 +318,12 @@ CONSISTENCY_CASES = {
     "ไม่มีธงเลย": {
         "1068": group((1068, outcome(1.95)), (1069, outcome(1.90))),
     },
-    "กลุ่มเดียวมี AH สามตัว": {
-        "1058": group((1058, outcome(1.91, True)), (1059, outcome(1.97, True)),
-                      (1068, outcome(1.30, True))),
+    "มีฝั่งเหย้าแต่ไม่มีฝั่งเยือน": {
+        "1058": group((1058, outcome(1.917, True))),
+    },
+    "ฝั่งเยือนอยู่คนละกลุ่มกับฝั่งเหย้า": {
+        "1058": group((1058, outcome(1.917, True))),
+        "1059": group((1059, outcome(1.97, True))),
     },
     "ไม่มี AH เลย": {
         "101": group((101, outcome(1.80)), (102, outcome(3.50)), (103, outcome(4.20))),
@@ -359,18 +413,19 @@ class TestFallbackCatalogCoverage(unittest.TestCase):
             self.assertEqual(odds_data.FALLBACK_AH_CATALOG.get(market_id), handicap,
                              f"market {market_id} ต้องเป็นเส้น {handicap}")
 
-    def test_pairs_every_home_id_with_the_next_id(self):
-        for market_id, handicap in odds_data.FALLBACK_AH_CATALOG.items():
-            if int(market_id) % 2 == 0:
-                self.assertIn(str(int(market_id) + 1), odds_data.FALLBACK_AH_CATALOG,
-                              f"ฝั่งเหย้า {market_id} ต้องมีฝั่งเยือนคู่กัน")
+    def test_holds_home_side_ids_only(self):
+        """รูปร่างเดียวกับสารบัญจริง — ฝั่งเยือนหาจาก id + 1 ไม่ต้องเก็บไว้"""
+        for market_id in odds_data.FALLBACK_AH_CATALOG:
+            self.assertEqual(int(market_id) % 2, 0,
+                             f"{market_id} เป็นเลขคี่ = ฝั่งเยือน ไม่ควรอยู่ในสารบัญ")
+            self.assertTrue(odds_data.is_ah_home_id(market_id, odds_data.FALLBACK_AH_CATALOG))
 
     def test_does_not_guess_past_the_confirmed_range(self):
         """เดาเลยขอบแล้วไปชนกับ id ของตลาดสูง-ต่ำ จะรายงานเส้นสูง-ต่ำเป็นแฮนดิแคป"""
         ids = [int(market_id) for market_id in odds_data.FALLBACK_AH_CATALOG]
 
         self.assertEqual(min(ids), 1058)   # -1.75 คือขอบล่างที่ยืนยันแล้ว
-        self.assertEqual(max(ids), 1077)   # +0.5 (ฝั่งเยือน) คือขอบบนที่ยืนยันแล้ว
+        self.assertEqual(max(ids), 1076)   # +0.5 คือขอบบนที่ยืนยันแล้ว
         self.assertNotIn(str(odds_data.MARKET_OU25_OVER), odds_data.FALLBACK_AH_CATALOG)
         self.assertNotIn(str(odds_data.MARKET_OU25_UNDER), odds_data.FALLBACK_AH_CATALOG)
 
@@ -400,10 +455,8 @@ class TestMainLineFlagIsStrict(unittest.TestCase):
             "1068": group((1068, outcome(1.30)), (1069, outcome(3.45))),
             "1072": group((1072, outcome(1.15)), (1073, outcome(5.20))),
         })
-        flagged = [market_id
-                   for _, mapping in odds_data.market_groups(data)
-                   for market_id, value in mapping.items()
-                   if odds_data.main_line_flag(value)]
+        scan = odds_data.scan_handicap_lines(data, CATALOG)
+        flagged = [row["market_id"] for row in scan["outcomes"] if row["flag"]]
 
         self.assertEqual(sorted(flagged), ["1058", "1059"])
 

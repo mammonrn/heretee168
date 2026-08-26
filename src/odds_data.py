@@ -73,6 +73,7 @@ AH_NAME_BLOCKERS = ("european", "3-way", "3 way", "three way", "corner", "card",
 #   1058 = -1.75, 1068 = -0.5, 1070 = -0.25, 1072 = 0, 1074 = +0.25, 1076 = +0.5
 # ได้สูตร: market id ฝั่งเหย้า = 1072 + 8 x handicap   (ทีละ 0.25 ลูก = ห่างกัน 2 id)
 # ฝั่งเยือนคือ id ฝั่งเหย้า + 1 (1068 คู่กับ 1069, 1058 คู่กับ 1059 — เห็นในของจริงทั้งคู่)
+# สารบัญเก็บแต่ id ฝั่งเหย้า เพราะใช้แค่แปลง id -> เลขเส้น ส่วนฝั่งเยือนหาจาก id + 1
 AH_MARKET_ID_AT_ZERO = MARKET_AH_0_HOME   # 1072 = เส้น 0
 AH_MARKET_IDS_PER_GOAL = 8                # 1 ลูก = 8 id (0.25 ลูก = 2 id)
 
@@ -87,16 +88,15 @@ FALLBACK_AH_RANGE = (-1.75, 0.5)
 def build_fallback_catalog(lowest, highest):
     """
     สร้างสารบัญสำรองจากสูตร market id ข้างบน ทีละ 0.25 ลูกตลอดช่วงที่ยืนยันแล้ว
-    ค่าของฝั่งเยือนใส่แบบกลับเครื่องหมาย — ยังไม่เคยยืนยันกับของจริง แต่ไม่กระทบผลลัพธ์
-    เพราะเลขเส้นที่เอาไปแสดงอ่านจากฝั่งเหย้าเสมอ (ดู find_main_line)
+
+    ใส่เฉพาะ id ฝั่งเหย้า เหมือนรูปร่างของสารบัญจริงที่ /v4/markets ส่งกลับมา
+    ฝั่งเยือนไม่ต้องมีในสารบัญ เพราะหาจาก id + 1 ในข้อมูลราคาอยู่แล้ว (ดู scan_handicap_lines)
     """
     catalog = {}
 
     for step in range(round((highest - lowest) / 0.25) + 1):
         handicap = round(lowest + step * 0.25, 2)
-        home_id = AH_MARKET_ID_AT_ZERO + round(handicap * AH_MARKET_IDS_PER_GOAL)
-        catalog[str(home_id)] = handicap
-        catalog[str(home_id + 1)] = -handicap if handicap else 0.0  # กัน -0.0 ที่อ่านแล้วสะดุด
+        catalog[str(AH_MARKET_ID_AT_ZERO + round(handicap * AH_MARKET_IDS_PER_GOAL))] = handicap
 
     return catalog
 
@@ -938,42 +938,6 @@ def main_line_flag(outcome):
     return read_main_line_flag(outcome) is True
 
 
-def market_groups(book_data):
-    """
-    คืน list ของ (คีย์กลุ่ม, {market id: outcome}) ตามที่ OddsPapi จัดกลุ่มมา
-
-    ต่างจาก build_market_index ตรงที่ "ไม่แบนราบ" — เก็บไว้ว่า market id ไหนอยู่กลุ่มเดียวกัน
-    ซึ่งจำเป็นสำหรับแฮนดิแคป เพราะฝั่งเหย้ากับฝั่งเยือนของเส้นเดียวกันอยู่กลุ่มเดียวกันเสมอ
-    (ของจริง: markets["1068"]["outcomes"] = {"1068": ..., "1069": ...})
-    """
-    groups = []
-
-    for key, entry in market_entries(book_data):
-        outcomes = entry.get("outcomes") if isinstance(entry, dict) else None
-        mapping = {}
-
-        if isinstance(outcomes, dict):
-            if "players" in outcomes:
-                if key is not None:
-                    mapping[str(key)] = outcomes
-            else:
-                for outcome_id, outcome in outcomes.items():
-                    mapping[str(outcome_id)] = outcome
-        elif isinstance(outcomes, list):
-            for outcome in outcomes:
-                if not isinstance(outcome, dict):
-                    continue
-                outcome_id = outcome.get("outcomeId", outcome.get("marketId", outcome.get("id")))
-                mapping[str(outcome_id if outcome_id is not None else key)] = outcome
-        elif key is not None:
-            mapping[str(key)] = entry
-
-        if mapping:
-            groups.append((str(key) if key is not None else None, mapping))
-
-    return groups
-
-
 def market_id_sort_key(market_id):
     """เรียง market id แบบตัวเลขก่อน (ตัวเลขมาก่อนตัวอักษร) — id ฝั่งเหย้าน้อยกว่าฝั่งเยือนเสมอ"""
     text = str(market_id)
@@ -992,6 +956,29 @@ SCAN_VERDICTS = {
 }
 
 
+def ah_away_id(home_id):
+    """
+    market id ฝั่งเยือนของเส้นเดียวกัน = id ฝั่งเหย้า + 1 เสมอ
+    ยืนยันจากของจริง: 1068 คู่กับ 1069, 1058 คู่กับ 1059
+    ไม่ใช่ตัวเลขล้วนก็จับคู่ไม่ได้ คืน None
+    """
+    text = str(home_id)
+    return str(int(text) + 1) if text.isdigit() else None
+
+
+def is_ah_home_id(market_id, catalog):
+    """
+    id นี้เป็นฝั่งเหย้าของเส้น AH ไหม — ต้องอยู่ในสารบัญ และต้องเป็นเลขคู่
+
+    ที่ต้องเป็นเลขคู่: สูตร id ฝั่งเหย้า = 1072 + 8 x handicap ให้เลขคู่เสมอ
+    (0.25 ลูก = 2 id) ยืนยันครบทุกจุดที่มีข้อมูล — 1058, 1068, 1070, 1072, 1074, 1076
+    เช็คตรงนี้กัน id ฝั่งเยือนถูกหยิบไปเป็นฝั่งเหย้าแล้วจับคู่เลื่อนไปหนึ่งช่อง
+    (เช่นสารบัญมีทั้ง 1058 และ 1059 ถ้าไม่เช็ค 1059 จะไปจับกับ 1060 กลายเป็นคนละเส้น)
+    """
+    text = str(market_id)
+    return text in catalog and text.isdigit() and int(text) % 2 == 0
+
+
 def scan_handicap_lines(book_data, catalog):
     """
     สแกน AH ทั้งหมดของเจ้ามือหนึ่งเจ้า แล้วคืน "ผลการตัดสินทั้งชุด" จากการเดินข้อมูลรอบเดียว
@@ -1001,6 +988,11 @@ def scan_handicap_lines(book_data, catalog):
     ก่อนหน้านี้รายงานมีตรรกะของตัวเอง (ดูแค่ธง ไม่ได้ดูว่าจับคู่ได้ไหมหรือราคาครบไหม)
     เลยเกิดกรณีที่รายงานบอก "เจอเส้นหลักที่ 1058" แต่ผล JSON จริงกลับเป็น fallback
 
+    การจับคู่: ไล่จาก id ฝั่งเหย้าที่อยู่ในสารบัญ แล้วหาฝั่งเยือนที่ id + 1 จาก index แบนราบ
+    สารบัญใช้แค่แปลง id ฝั่งเหย้า -> เลขเส้น เท่านั้น ฝั่งเยือนไม่จำเป็นต้องอยู่ในสารบัญ
+    (ของจริง /v4/markets ให้ id ฝั่งเยือนไม่ครบ ถ้าไปบังคับว่าต้องมีจะจับคู่ไม่ได้เลย)
+    และใช้ index แบนราบแทนการดูทีละกลุ่ม เพราะการจัดกลุ่มของ OddsPapi ไม่ใช่ตัวกำหนดคู่
+
     คืน dict:
       outcomes = ทุก AH outcome ที่เจอ (market id, เลขเส้น, ธง, ราคา) ไว้ให้รายงานพิมพ์
       pairs    = คู่เหย้า-เยือนที่จับได้ พร้อมผลตรวจว่าปักธงไหม ราคาครบไหม
@@ -1009,40 +1001,47 @@ def scan_handicap_lines(book_data, catalog):
       stamps   = changedAt ของเส้นที่เลือก
     """
     catalog = catalog or {}
-    rows, pairs = [], []
 
-    for group_key, mapping in market_groups(book_data):
-        ah_ids = sorted((market_id for market_id in mapping if market_id in catalog),
-                        key=market_id_sort_key)
-        if not ah_ids:
-            continue
+    # แกะชั้นครั้งเดียวต่อ outcome แล้วใช้ตัวเดียวกันทั้งอ่านธงและอ่านราคา
+    # ธง mainLine กับ price อยู่ใน dict ใบเดียวกัน จึงต้องมาจาก object เดียวกันเสมอ
+    outcomes = {market_id: unwrap_outcome(entry)
+                for market_id, entry in build_market_index(book_data).items()}
 
-        # แกะชั้นครั้งเดียวต่อ outcome แล้วใช้ตัวเดียวกันทั้งอ่านธงและอ่านราคา
-        # ธง mainLine กับ price อยู่ใน dict ใบเดียวกัน จึงต้องมาจาก object เดียวกันเสมอ
-        outcomes = {market_id: unwrap_outcome(mapping[market_id]) for market_id in ah_ids}
+    def row(market_id, handicap, side):
+        outcome = outcomes[market_id]
+        return {
+            "market_id": market_id,
+            "side": side,
+            "handicap": handicap,
+            "flag": read_main_line_flag(outcome),
+            "price": outcome_price(outcome),
+        }
 
-        for market_id in ah_ids:
-            outcome = outcomes[market_id]
-            rows.append({
-                "market_id": market_id,
-                "group": group_key,
-                "handicap": catalog[market_id],
-                "flag": read_main_line_flag(outcome),
-                "price": outcome_price(outcome),
-            })
+    rows, pairs, seen = [], [], set()
 
-        # กลุ่มที่ไม่ได้มี AH พอดีสองตัว จับคู่เหย้า-เยือนไม่ได้ ข้ามไป (แต่ยังโชว์ในรายงาน)
-        if len(ah_ids) != 2:
-            continue
+    for home_id in sorted((market_id for market_id in outcomes
+                           if is_ah_home_id(market_id, catalog)), key=market_id_sort_key):
+        handicap = catalog[home_id]
+        away_id = ah_away_id(home_id)
 
-        home_id, away_id = ah_ids
+        rows.append(row(home_id, handicap, "home"))
+        seen.add(home_id)
+
+        if away_id is None or away_id not in outcomes:
+            continue  # ไม่มีฝั่งเยือน จับคู่ไม่ได้ (ยังโชว์ฝั่งเหย้าในรายงานไว้ให้เห็น)
+
+        # เลขเส้นของฝั่งเยือนใช้ค่าจากสารบัญถ้ามี ไม่มีก็กลับเครื่องหมายของฝั่งเหย้า
+        away_handicap = catalog.get(away_id, -handicap if handicap else 0.0)
+        rows.append(row(away_id, away_handicap, "away"))
+        seen.add(away_id)
+
         home_outcome, away_outcome = outcomes[home_id], outcomes[away_id]
         home_price, away_price = outcome_price(home_outcome), outcome_price(away_outcome)
 
         pairs.append({
             "home_id": home_id,
             "away_id": away_id,
-            "handicap": catalog[home_id],
+            "handicap": handicap,
             "home": home_price,
             "away": away_price,
             "flagged": main_line_flag(home_outcome) and main_line_flag(away_outcome),
@@ -1050,6 +1049,12 @@ def scan_handicap_lines(book_data, catalog):
                           for value in (home_price, away_price)),
             "outcomes": (home_outcome, away_outcome),
         })
+
+    # id ที่อยู่ในสารบัญแต่ไม่ได้เข้าคู่ไหนเลย (เช่น id ฝั่งเยือนที่ไม่มีฝั่งเหย้าคู่กัน)
+    # ยังต้องโผล่ในรายงาน ไม่งั้นจะดูเหมือนเจ้านี้ไม่มี AH เลยทั้งที่มี
+    for market_id in sorted((m for m in outcomes if m in catalog and m not in seen),
+                            key=market_id_sort_key):
+        rows.append(row(market_id, catalog[market_id], "เดี่ยว"))
 
     return decide_main_line(rows, pairs)
 
