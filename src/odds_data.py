@@ -379,29 +379,78 @@ def match_fixture(oddspapi_fixtures, home_name, away_name, kickoff_iso=None, lea
 # ---------- การกลั่นราคา ----------
 
 
-def find_market_entry(book_data, market_id):
-    """
-    หา entry ของ market ที่ต้องการจากข้อมูลเจ้ามือหนึ่งเจ้า (ยังไม่แกะชั้น outcomes)
-    คืนตัว entry ดิบ เพราะบางฟิลด์ เช่น changedAt อาจอยู่ระดับ market ไม่ใช่ในระดับ outcome
-    """
-    if isinstance(book_data, dict):
-        for key in (str(market_id), market_id):
-            if key in book_data:
-                return book_data[key]
-        for nested in ("markets", "odds", "prices"):
-            if isinstance(book_data.get(nested), (dict, list)):
-                found = find_market_entry(book_data[nested], market_id)
-                if found is not None:
-                    return found
+def market_entries(book_data):
+    """คืน list ของ (key, entry) จากส่วน markets ของเจ้ามือหนึ่งเจ้า — รองรับ dict, list และโครงสร้างแบน"""
+    if not isinstance(book_data, (dict, list)):
+        return []
 
     if isinstance(book_data, list):
-        for item in book_data:
-            if isinstance(item, dict):
-                item_id = item.get("marketId", item.get("market_id", item.get("id")))
-                if str(item_id) == str(market_id):
-                    return item
+        return [(entry.get("marketId", entry.get("id")), entry)
+                for entry in book_data if isinstance(entry, dict)]
 
-    return None
+    for nested in ("markets", "odds", "prices"):
+        container = book_data.get(nested)
+        if isinstance(container, dict):
+            return list(container.items())
+        if isinstance(container, list):
+            return [(entry.get("marketId", entry.get("id")), entry)
+                    for entry in container if isinstance(entry, dict)]
+
+    # ไม่มีชั้น markets เลย ถือว่า book_data เองคือตาราง market (โครงสร้างแบบเก่า)
+    return list(book_data.items())
+
+
+def build_market_index(book_data):
+    """
+    แบนราบราคาของเจ้ามือหนึ่งเจ้าเป็น {market_id (str): outcome dict}
+
+    ทำไมต้องทำ index: OddsPapi **ไม่ได้** ใช้ทุก market id เป็น key ระดับบนของ markets
+    แต่จับ market ที่เกี่ยวข้องกันเป็นกลุ่ม แล้วใช้ id ตัวแรกของกลุ่มเป็น key เท่านั้น
+    ส่วน id ที่เหลือของกลุ่มไปอยู่เป็น key ใน outcomes เช่น (ของจริงจาก raw response)
+
+        markets["101"]["outcomes"] = {"101": ..., "102": ..., "103": ...}   # 1X2 ครบสามผล
+        markets["1068"]["outcomes"] = {"1068": ..., "1069": ...}            # AH -0.5 สองฝั่ง
+
+    ฉะนั้นการไปหา markets["102"] หรือ markets["1069"] ตรง ๆ จะไม่เจอ (ได้ null ทุกช่อง)
+    วิธีที่ถูกคือไล่ทุกกลุ่ม แล้วเก็บ key ที่อยู่ใน outcomes ทั้งหมดลงตารางแบนใบเดียว
+    """
+    index = {}
+
+    def remember(market_id, outcome, entry):
+        """เก็บ outcome ลง index — ถ้า changedAt อยู่ระดับกลุ่ม ให้พ่วงติดไปกับ outcome ด้วย"""
+        if isinstance(outcome, dict):
+            stamp = outcome_changed_at(entry) if isinstance(entry, dict) else None
+            if stamp and not outcome_changed_at(outcome):
+                outcome = dict(outcome, changedAt=stamp)  # copy ตื้น ๆ ไม่แก้ข้อมูลต้นฉบับ
+        index.setdefault(str(market_id), outcome)
+
+    for key, entry in market_entries(book_data):
+        outcomes = entry.get("outcomes") if isinstance(entry, dict) else None
+
+        if isinstance(outcomes, dict):
+            # บางรูปแบบ outcomes เป็นตัว outcome เดี่ยว ๆ เลย (มี players อยู่ตรงนั้น)
+            # ไม่ได้ key ด้วย market id — ใช้ key ของกลุ่มแทน
+            if "players" in outcomes:
+                if key is not None:
+                    remember(key, outcomes, entry)
+                continue
+            for outcome_id, outcome in outcomes.items():
+                remember(outcome_id, outcome, entry)
+            continue
+
+        if isinstance(outcomes, list):
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                outcome_id = outcome.get("outcomeId", outcome.get("marketId", outcome.get("id")))
+                remember(outcome_id if outcome_id is not None else key, outcome, entry)
+            continue
+
+        # ไม่มีชั้น outcomes — ตัว entry เองคือ outcome (โครงสร้างแบบเก่า)
+        if key is not None:
+            index.setdefault(str(key), entry)
+
+    return index
 
 
 def unwrap_outcome(entry):
@@ -435,8 +484,11 @@ def unwrap_outcome(entry):
 
 
 def find_outcome(book_data, market_id):
-    """หา outcome ของ market ที่ต้องการ แล้วแกะชั้น outcomes ให้เรียบร้อยก่อนคืนค่า"""
-    return unwrap_outcome(find_market_entry(book_data, market_id))
+    """
+    หา outcome ของ market ที่ต้องการจากข้อมูลเจ้ามือหนึ่งเจ้า
+    ทำ index แบนราบก่อนแล้วค่อย lookup ด้วย market id ตรง ๆ (ดูเหตุผลใน build_market_index)
+    """
+    return unwrap_outcome(build_market_index(book_data).get(str(market_id)))
 
 
 def outcome_price(outcome):
@@ -486,41 +538,39 @@ def outcome_changed_at(outcome):
     return None
 
 
-def price_of(book_data, market_id, changed_stamps):
-    """ดึงราคาของ market เดียว พร้อมเก็บ changedAt ไว้หาค่าล่าสุดทีหลัง"""
-    entry = find_market_entry(book_data, market_id)
-    outcome = unwrap_outcome(entry)
+def price_of(market_index, market_id, changed_stamps):
+    """ดึงราคาของ market เดียวจาก index พร้อมเก็บ changedAt ไว้หาค่าล่าสุดทีหลัง"""
+    outcome = unwrap_outcome(market_index.get(str(market_id)))
 
-    # changedAt อาจอยู่ที่ระดับ market หรือระดับ outcome ก็ได้ เก็บอันที่เจอก่อน
-    for stamp in (outcome_changed_at(entry), outcome_changed_at(outcome)):
-        if stamp:
-            changed_stamps.append(stamp)
-            break
+    stamp = outcome_changed_at(outcome)
+    if stamp:
+        changed_stamps.append(stamp)
 
     return outcome_price(outcome)
 
 
 def distill_book(book_data):
     """กลั่นราคาของเจ้ามือหนึ่งเจ้าให้เหลือเฉพาะ market ที่ใช้วิเคราะห์"""
+    index = build_market_index(book_data)  # ทำครั้งเดียวต่อเจ้า แล้วใช้ซ้ำทุก market
     stamps = []
 
     book = {
         "1x2": {
-            "home": price_of(book_data, MARKET_1X2_HOME, stamps),
-            "draw": price_of(book_data, MARKET_1X2_DRAW, stamps),
-            "away": price_of(book_data, MARKET_1X2_AWAY, stamps),
+            "home": price_of(index, MARKET_1X2_HOME, stamps),
+            "draw": price_of(index, MARKET_1X2_DRAW, stamps),
+            "away": price_of(index, MARKET_1X2_AWAY, stamps),
         },
         "ah_-0.5": {
-            "home": price_of(book_data, MARKET_AH_M05_HOME, stamps),
-            "away": price_of(book_data, MARKET_AH_M05_AWAY, stamps),
+            "home": price_of(index, MARKET_AH_M05_HOME, stamps),
+            "away": price_of(index, MARKET_AH_M05_AWAY, stamps),
         },
         "ah_0": {
-            "home": price_of(book_data, MARKET_AH_0_HOME, stamps),
-            "away": price_of(book_data, MARKET_AH_0_AWAY, stamps),
+            "home": price_of(index, MARKET_AH_0_HOME, stamps),
+            "away": price_of(index, MARKET_AH_0_AWAY, stamps),
         },
         "ou_2.5": {
-            "over": price_of(book_data, MARKET_OU25_OVER, stamps),
-            "under": price_of(book_data, MARKET_OU25_UNDER, stamps),
+            "over": price_of(index, MARKET_OU25_OVER, stamps),
+            "under": price_of(index, MARKET_OU25_UNDER, stamps),
         },
     }
 
