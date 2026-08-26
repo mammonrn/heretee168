@@ -296,8 +296,8 @@ def fetch_odds_context(match_summary, log=lambda message: None):
 
 
 # ชื่อเส้นแฮนดิแคปภาษาไทย เรียงทีละ 0.25 (เลขคือจำนวนลูกที่ต่อ)
-# ตอนนี้ระบบดึงราคาจริงจาก market id ตายตัวแค่ 2 เส้นเท่านั้น คือ 0 กับ 0.5 (ดู MARKET_LINES)
-# ที่เหลือเก็บไว้เป็น reference เผื่ออนาคตเพิ่ม market id ใหม่ — เพิ่มต่อทีละ 0.25 ตามรูปแบบเดิม
+# ตอนนี้ระบบหาเส้นหลักที่ตลาดใช้จริงจากธง mainLine แล้ว จึงเจอเลขเส้นได้ทุกแบบที่เจ้ามือเปิด
+# ไม่ใช่แค่ 0 กับ 0.5 เหมือนก่อน — เส้นไหนไม่มีชื่อในตารางนี้จะบอกเป็นตัวเลขเปล่า ๆ ไม่เดาชื่อให้
 # หมายเหตุ: ตารางนี้เท่าที่มีข้อมูลตอนนี้ ยังไม่ใช่รายการที่สมบูรณ์ 100%
 HANDICAP_LINE_NAMES = {
     "0": "ต่อเสมอ",
@@ -317,25 +317,71 @@ HANDICAP_LINE_ALIASES = {
     "0-0.5": ("ปป.",),
 }
 
-# เส้นที่ดึงราคาจริงได้ตอนนี้ ผูกกับ market id ใน odds_data.py
-#   ah_-0.5 = market 1068/1069 -> เส้น 0.5    ah_0 = market 1072/1073 -> เส้น 0
-MARKET_LINES = {"ah_-0.5": "0.5", "ah_0": "0"}
+
+def line_key_value(key):
+    """
+    ค่าตัวเลขของคีย์ใน HANDICAP_LINE_NAMES เช่น "0.5" -> 0.5, "0-0.5" -> 0.25 (เส้นควบคือค่ากลาง)
+    คีย์ที่แปลงเป็นตัวเลขไม่ได้คืน None
+    """
+    try:
+        numbers = [float(part) for part in str(key).split("-")]
+    except ValueError:
+        return None
+    return round(sum(numbers) / len(numbers), 2) if numbers else None
 
 
-def handicap_line_label(line):
-    """ชื่อเส้นพร้อมวงเล็บตัวเลขกำกับ เช่น "0.5" -> 'ครึ่งลูก [0.5]' (ไม่รู้จักเส้นนั้น -> None)"""
-    name = HANDICAP_LINE_NAMES.get(line)
-    return f"{name} [{line}]" if name else None
+# ตารางกลับทาง: เลขเส้นจริง -> คีย์ใน HANDICAP_LINE_NAMES
+# สร้างจากคีย์ของตารางข้างบนล้วน ๆ ไม่ได้เติมชื่อเส้นใหม่เข้าไปเอง
+HANDICAP_LINE_KEYS = {
+    value: key for key, value in ((k, line_key_value(k)) for k in HANDICAP_LINE_NAMES)
+    if value is not None
+}
 
 
-def market_line_label(market):
-    """ชื่อเส้นของ market ที่ใช้จริง เช่น "ah_-0.5" -> 'ครึ่งลูก [0.5]'"""
-    line = MARKET_LINES.get(market)
-    return handicap_line_label(line) if line else None
+def format_line_number(value):
+    """เลขเส้นให้อ่านสวย: 1.0 -> "1", 0.5 -> "0.5", 0.25 -> "0.25" (ไม่ใช่ตัวเลขคืน None)"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    text = f"{round(float(value), 2):.2f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def handicap_line_label(handicap):
+    """
+    ชื่อเส้นพร้อมวงเล็บตัวเลข จากเลข handicap จริงที่ดึงมาได้ (คิดจากค่าสัมบูรณ์ = จำนวนลูกที่ต่อ)
+      -0.5 -> 'ครึ่งลูก [0.5]'      -0.25 -> 'เสมอควบครึ่ง [0-0.5]'
+    เส้นที่ไม่มีชื่อในตาราง -> บอกแค่ตัวเลข เช่น '[0.75]' — ห้ามเดาชื่อเส้นที่เราไม่รู้จัก
+    """
+    if isinstance(handicap, bool) or not isinstance(handicap, (int, float)):
+        return None
+
+    number = format_line_number(abs(handicap))
+    key = HANDICAP_LINE_KEYS.get(round(abs(handicap), 2))
+    name = HANDICAP_LINE_NAMES.get(key) if key else None
+    return f"{name} [{key}]" if name else f"[{number}]"
+
+
+def handicap_line_giver(handicap):
+    """
+    ใครเป็นฝ่ายต่อลูกให้ตามเลขเส้น (ตัวเลข handicap เป็นมุมของฝั่งเหย้าเสมอ)
+      ติดลบ = เจ้าบ้านต่อ, เป็นบวก = ทีมเยือนต่อ, ศูนย์ = ต่อเสมอไม่มีใครต่อใคร
+    ไม่ใช่การเดา — อ่านตรง ๆ จากเลข handicap ในสารบัญ market
+    """
+    if isinstance(handicap, bool) or not isinstance(handicap, (int, float)):
+        return None
+    if handicap < 0:
+        return "home"
+    if handicap > 0:
+        return "away"
+    return "level"
 
 
 # ราคาต่อรองสองฝั่งที่ห่างกันน้อยกว่านี้ ถือว่าตลาดมองสูสี ไม่มีใครเป็นต่อชัด
 HANDICAP_LEVEL_GAP = 0.05
+
+# ชื่อช่องที่เป็น "ราคา" จริง ๆ ในข้อมูลที่กลั่นแล้ว — ช่อง handicap มีข้อมูลประกอบ
+# (เลขเส้น / แหล่งที่มา) ปนอยู่ด้วย ถ้านับทั้ง dict จะเข้าใจผิดว่ามีราคาทั้งที่ทุกช่องว่างเปล่า
+PRICE_FIELDS = ("home", "draw", "away", "over", "under")
 
 
 def decimal_to_hk(price):
@@ -365,17 +411,67 @@ def handicap_favourite(book):
     """
     ฝั่งที่ตลาดถือหางตามราคาต่อรอง คิดจากราคาทศนิยมต้นทาง (ราคาต่ำกว่า = เป็นต่อ)
     ต้องคิดก่อนแปลง เพราะหลังแปลงแล้วเลขบวก/ลบเรียงกันคนละทาง เทียบตรง ๆ ไม่ได้
+
+    คิดจาก "เส้นหลักที่หาเจอจริง" (book["handicap"] ซึ่งมาจาก mainLine) เป็นหลัก
+
+    ข้อสำคัญ: ถ้าเป็นเส้นหลักจริงและไม่ใช่เส้น 0 ให้ยึด "ฝั่งที่เป็นคนต่อลูก" เป็นฝั่งถือหางเลย
+    ไม่ใช่ฝั่งที่ราคาต่ำกว่า — เพราะพอเป็นเส้นหลัก ราคาสองฝั่งจะถูกดันมาใกล้ 2.00 พอ ๆ กัน
+    ตัวที่บอกว่าใครเป็นต่อคือ "เส้น" ไม่ใช่ "ราคา" (เช่นเจ้าบ้านต่อลูกเดียว ราคา 1.98 / 1.88
+    ถ้าไปเทียบราคาดิบจะได้คำตอบว่าทีมเยือนเป็นต่อ ซึ่งกลับข้างกับความจริงคนละทาง)
+
+    ส่วนเส้น 0 (ต่อเสมอ ไม่มีใครต่อใคร) และเส้นตายตัวตอน fallback ยังเทียบจากราคาเหมือนเดิม
+    เส้นตายตัวไม่ได้การันตีว่าเป็นเส้นที่ตลาดใช้ เครื่องหมายของมันจึงบอกอะไรไม่ได้
     คืน "home" / "away" / "level" (สูสี) หรือ None เมื่อไม่มีราคาต่อรองที่เทียบได้
     """
-    for market in ("ah_-0.5", "ah_0"):
-        prices = book.get(market) or {}
+    main_line = book.get("handicap")
+    if isinstance(main_line, dict) and main_line.get("source") == "mainline":
+        giver = handicap_line_giver(main_line.get("handicap"))
+        if giver in ("home", "away"):
+            return giver
+
+    sources = [book.get("handicap")] + [book.get(market) for market in ("ah_-0.5", "ah_0")]
+
+    for prices in sources:
+        if not isinstance(prices, dict):
+            continue
         home, away = prices.get("home"), prices.get("away")
-        if not all(isinstance(value, (int, float)) for value in (home, away)):
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for value in (home, away)):
             continue
         if abs(home - away) < HANDICAP_LEVEL_GAP:
             return "level"
         return "home" if home < away else "away"
     return None
+
+
+def summarize_handicap(book):
+    """
+    ย่อเส้นแฮนดิแคปที่จะเอาไปพูดให้เหลือเท่าที่ AI ต้องใช้ — ไม่มีเส้นที่ใช้ได้เลยคืน None
+
+    ตัวเลขเส้นมาจากสารบัญ market จริง (mainLine) หรือจากเส้นตายตัวตอน fallback
+    source บอกไว้ด้วยว่ามาจากทางไหน เพราะสองกรณีนี้พูดได้ไม่เท่ากัน:
+      mainline = เส้นหลักที่ตลาดใช้จริง ณ ตอนดึง พูดได้ว่าคู่นี้ตลาดตั้งต่อเท่านี้
+      fallback = แค่ราคาที่เส้นตายตัวเส้นหนึ่ง ไม่ใช่เส้นหลัก ห้ามพูดว่าตลาดตั้งต่อเท่านี้
+    """
+    handicap = book.get("handicap")
+    if not isinstance(handicap, dict):
+        return None
+
+    value = handicap.get("handicap")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = None
+
+    prices = convert_handicap({"home": handicap.get("home"), "away": handicap.get("away")})
+    if not prices or all(price is None for price in prices.values()):
+        return None
+
+    return {
+        "line": format_line_number(abs(value)) if value is not None else None,
+        "line_label": handicap_line_label(value),
+        "giver": handicap_line_giver(value),
+        "prices": prices,
+        "source": handicap.get("source"),
+    }
 
 
 def summarize_odds_for_prompt(odds):
@@ -388,9 +484,9 @@ def summarize_odds_for_prompt(odds):
         return None
 
     def has_price(book):
-        return any(value is not None
-                   for market, prices in book.items() if isinstance(prices, dict)
-                   for value in prices.values())
+        return any(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for prices in book.values() if isinstance(prices, dict)
+                   for field, value in prices.items() if field in PRICE_FIELDS)
 
     slug = next((s for s in books if SHARP_BOOK_FOR_PROMPT in s.lower() and has_price(books[s])), None)
     if slug is None:
@@ -408,11 +504,9 @@ def summarize_odds_for_prompt(odds):
     return {
         "source": "OddsPapi",
         "bookmaker": slug,
-        "1x2": one_x_two,                                   # ยังเป็นราคาทศนิยมตามเดิม
-        "ah_-0.5": convert_handicap(book.get("ah_-0.5")),   # แปลงเป็นราคาที่คนไทยอ่าน
-        "ah_0": convert_handicap(book.get("ah_0")),
+        "1x2": one_x_two,                       # ยังเป็นราคาทศนิยมตามเดิม
+        "handicap": summarize_handicap(book),   # เส้นหลักเส้นเดียว ราคาแปลงเป็นแบบที่คนไทยอ่าน
         "handicap_price_format": "thai",
-        "handicap_lines": {market: market_line_label(market) for market in MARKET_LINES},
         "handicap_favourite": handicap_favourite(book),
         "market_favourite": favourite,
         "total_books": odds.get("total_books"),

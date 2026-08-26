@@ -1,0 +1,480 @@
+"""
+Unit test ของการหา "เส้นแฮนดิแคปหลักที่ตลาดใช้จริง" (mainLine) — ไม่ยิง API เลยสักครั้ง
+
+ทุกเคสใช้ข้อมูลจำลอง (mock) ที่เขียนเลียนโครงสร้างจริงของ OddsPapi เท่าที่ยืนยันมาแล้ว
+ไม่ได้ต่อเน็ต ไม่ได้แตะ cache.db จริง (แคชถูก monkeypatch ทิ้งในเทสต์ที่เกี่ยวข้อง)
+
+วิธีรัน:
+    python3 src/test_mainline.py
+    python3 src/test_mainline.py -v
+"""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import analyze
+import odds_data
+
+
+# ---------- ตัวช่วยสร้างข้อมูลจำลอง ----------
+
+
+def outcome(price, main_line=None, changed_at=None):
+    """
+    outcome หนึ่งช่องตามโครงสร้างจริง: ราคาซ่อนอยู่ใน players["0"]["price"]
+    main_line=None แปลว่าไม่มีฟิลด์ mainLine เลย (จำลอง response รุ่นเก่า)
+    """
+    data = {"players": {"0": {"price": price}}}
+    if main_line is not None:
+        data["mainLine"] = main_line
+    if changed_at is not None:
+        data["changedAt"] = changed_at
+    return data
+
+
+def group(*pairs):
+    """market กลุ่มหนึ่ง: {"outcomes": {market_id: outcome, ...}}"""
+    return {"outcomes": {str(market_id): value for market_id, value in pairs}}
+
+
+def book(markets):
+    """ข้อมูลเจ้ามือหนึ่งเจ้า: {"markets": {คีย์กลุ่ม: กลุ่ม}}"""
+    return {"markets": markets}
+
+
+# สารบัญที่ใช้ในเทสต์ — เลียนของที่ /v4/markets ควรคืนมา (เฉพาะ AH)
+CATALOG = {
+    "1068": -0.5, "1069": 0.5,
+    "1070": -0.25, "1071": 0.25,
+    "1072": 0.0, "1073": 0.0,
+    "1074": 0.25, "1075": -0.25,
+    "1076": 0.5, "1077": -0.5,
+    "1080": -0.75, "1081": 0.75,
+    "1090": -1.0, "1091": 1.0,
+}
+
+
+class TestMarketCatalogParsing(unittest.TestCase):
+    """แปลง response ของ /v4/markets เป็นสารบัญ {market id: handicap}"""
+
+    def test_keeps_only_asian_handicap_markets(self):
+        payload = [
+            {"marketId": 101, "marketName": "1X2 Home", "handicap": None},
+            {"marketId": 1068, "marketName": "Asian Handicap -0.5", "handicap": -0.5},
+            {"marketId": 1074, "marketName": "Asian Handicap +0.25", "handicap": 0.25},
+            {"marketId": 1010, "marketName": "Over/Under 2.5 Over", "handicap": 2.5},
+        ]
+        self.assertEqual(odds_data.parse_market_catalog(payload),
+                         {"1068": -0.5, "1074": 0.25})
+
+    def test_accepts_payload_wrapped_in_dict(self):
+        payload = {"data": [{"marketId": "1072", "marketName": "Asian Handicap 0",
+                             "handicap": "0"}]}
+        self.assertEqual(odds_data.parse_market_catalog(payload), {"1072": 0.0})
+
+    def test_parses_string_handicaps_with_plus_sign(self):
+        payload = [{"marketId": 1076, "marketName": "Asian Handicap +0.5", "handicap": "+0.5"}]
+        self.assertEqual(odds_data.parse_market_catalog(payload), {"1076": 0.5})
+
+    def test_drops_markets_without_a_usable_handicap(self):
+        payload = [{"marketId": 1068, "marketName": "Asian Handicap -0.5", "handicap": "n/a"},
+                   {"marketId": 1069, "marketName": "Asian Handicap +0.5"}]
+        self.assertEqual(odds_data.parse_market_catalog(payload), {})
+
+    def test_accepts_the_short_ah_spelling(self):
+        payload = [{"marketId": 1070, "marketName": "AH -0.25", "handicap": -0.25},
+                   {"marketId": 1076, "marketName": "AH +0.5", "handicap": 0.5}]
+        self.assertEqual(odds_data.parse_market_catalog(payload),
+                         {"1070": -0.25, "1076": 0.5})
+
+    def test_short_spelling_does_not_match_unrelated_names(self):
+        payload = [{"marketId": 500, "marketName": "Ahead At Half Time", "handicap": 0.5}]
+        self.assertEqual(odds_data.parse_market_catalog(payload), {})
+
+    def test_drops_other_periods_and_other_handicap_types(self):
+        payload = [
+            {"marketId": 2068, "marketName": "1st Half Asian Handicap -0.5", "handicap": -0.5},
+            {"marketId": 3068, "marketName": "Corner Asian Handicap -1.5", "handicap": -1.5},
+            {"marketId": 4068, "marketName": "European Handicap -1", "handicap": -1.0},
+            {"marketId": 1068, "marketName": "Asian Handicap -0.5", "handicap": -0.5},
+        ]
+        self.assertEqual(odds_data.parse_market_catalog(payload), {"1068": -0.5})
+
+    def test_ignores_junk_entries_without_crashing(self):
+        payload = ["ไม่ใช่ dict", None, {"marketName": "Asian Handicap 0", "handicap": 0}]
+        self.assertEqual(odds_data.parse_market_catalog(payload), {})
+
+
+class TestFetchMarketCatalog(unittest.TestCase):
+    """fetch_market_catalog ต้อง fail-safe และแคชยาว ไม่กินโควตาต่อการวิเคราะห์"""
+
+    def setUp(self):
+        self.calls = []
+        odds_data._market_catalog_cache["map"] = None
+        self._api_get = odds_data.api_get
+        self._get = odds_data.cache_db.get_odds
+        self._save = odds_data.cache_db.save_odds
+        self._init = odds_data.cache_db.init_db
+        # ตัด cache.db จริงออกไปให้หมด เทสต์ต้องไม่แตะไฟล์ฐานข้อมูลของจริง
+        self.saved = {}
+        odds_data.cache_db.init_db = lambda *a, **k: None
+        odds_data.cache_db.get_odds = lambda key, ttl, **k: self.saved.get(key)
+        odds_data.cache_db.save_odds = lambda key, payload, **k: self.saved.__setitem__(
+            key, {"payload": payload, "created_at": "จำลอง"})
+
+    def tearDown(self):
+        odds_data.api_get = self._api_get
+        odds_data.cache_db.get_odds = self._get
+        odds_data.cache_db.save_odds = self._save
+        odds_data.cache_db.init_db = self._init
+        odds_data._market_catalog_cache["map"] = None
+
+    def fake_api(self, payload):
+        def _api_get(endpoint, params, api_key=None, counter=None):
+            self.calls.append((endpoint, dict(params)))
+            return payload
+        odds_data.api_get = _api_get
+
+    def test_calls_markets_endpoint_with_sport_id(self):
+        self.fake_api([{"marketId": 1068, "marketName": "Asian Handicap -0.5", "handicap": -0.5}])
+        catalog = odds_data.fetch_market_catalog(api_key="x")
+
+        self.assertEqual(catalog, {"1068": -0.5})
+        self.assertEqual(self.calls, [("markets", {"sportId": odds_data.SPORT_ID})])
+
+    def test_second_call_uses_cache_and_spends_no_quota(self):
+        self.fake_api([{"marketId": 1068, "marketName": "Asian Handicap -0.5", "handicap": -0.5}])
+        odds_data.fetch_market_catalog(api_key="x")
+        odds_data._market_catalog_cache["map"] = None  # จำลองการรีสตาร์ทโปรเซส
+        catalog = odds_data.fetch_market_catalog(api_key="x")
+
+        self.assertEqual(catalog, {"1068": -0.5})
+        self.assertEqual(len(self.calls), 1, "ครั้งที่สองต้องอ่านจากแคช ไม่ยิง API ซ้ำ")
+
+    def test_cache_ttl_is_seven_days(self):
+        self.assertEqual(odds_data.MARKET_CATALOG_TTL, 7 * 24 * 60 * 60)
+
+    def test_falls_back_when_api_fails(self):
+        def _api_get(endpoint, params, api_key=None, counter=None):
+            raise SystemExit(1)  # api_get ใช้ fail() ที่เรียก sys.exit
+        odds_data.api_get = _api_get
+
+        self.assertEqual(odds_data.fetch_market_catalog(api_key="x"),
+                         odds_data.FALLBACK_AH_CATALOG)
+
+    def test_falls_back_when_response_has_no_handicap_markets(self):
+        self.fake_api([{"marketId": 101, "marketName": "1X2 Home"}])
+        self.assertEqual(odds_data.fetch_market_catalog(api_key="x"),
+                         odds_data.FALLBACK_AH_CATALOG)
+
+    def test_does_not_cache_the_fallback_catalog(self):
+        self.fake_api([])
+        odds_data.fetch_market_catalog(api_key="x")
+        self.assertNotIn(odds_data.MARKET_CATALOG_CACHE_KEY, self.saved)
+
+
+class TestFindMainLine(unittest.TestCase):
+    """สแกน AH ทุกเส้นที่เจ้ามือเสนอ แล้วหยิบเส้นที่ mainLine=true ทั้งสองฝั่ง"""
+
+    def test_picks_the_line_flagged_on_both_sides(self):
+        data = book({
+            "101": group((101, outcome(1.80)), (102, outcome(3.50)), (103, outcome(4.20))),
+            "1068": group((1068, outcome(1.95, False)), (1069, outcome(1.90, False))),
+            "1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, True))),
+            "1090": group((1090, outcome(2.30, False)), (1091, outcome(1.62, False))),
+        })
+        found = odds_data.find_main_line(data, CATALOG)
+
+        self.assertEqual(found["handicap"], -0.75)
+        self.assertEqual(found["line"], 0.75)
+        self.assertEqual(found["source"], "mainline")
+        self.assertEqual(found["home"], 2.02)
+        self.assertEqual(found["away"], 1.84)
+        self.assertEqual(found["market_ids"], {"home": "1080", "away": "1081"})
+
+    def test_ignores_a_line_flagged_on_one_side_only(self):
+        data = book({"1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, False)))})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_returns_none_when_no_outcome_carries_the_flag(self):
+        data = book({"1068": group((1068, outcome(1.95)), (1069, outcome(1.90)))})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_skips_a_main_line_that_is_missing_a_price(self):
+        data = book({"1080": group((1080, outcome(2.02, True)), (1081, outcome(None, True)))})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_ignores_non_handicap_markets_even_when_flagged(self):
+        data = book({"101": group((101, outcome(1.80, True)), (102, outcome(3.50, True)))})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_ignores_market_ids_missing_from_the_catalog(self):
+        data = book({"9998": group((9998, outcome(1.95, True)), (9999, outcome(1.90, True)))})
+        self.assertIsNone(odds_data.find_main_line(data, CATALOG))
+
+    def test_reads_the_line_number_from_the_home_side_market(self):
+        """เลขเส้นต้องอ่านจาก market id ฝั่งเหย้า (ตัวน้อยกว่า) ไม่ใช่ฝั่งเยือน"""
+        data = book({"1074": group((1075, outcome(1.90, True)), (1074, outcome(1.94, True)))})
+        found = odds_data.find_main_line(data, CATALOG)
+
+        self.assertEqual(found["handicap"], 0.25)          # ค่าของ 1074 ไม่ใช่ของ 1075
+        self.assertEqual(found["home"], 1.94)
+        self.assertEqual(found["market_ids"]["home"], "1074")
+
+    def test_zero_line_is_a_valid_main_line(self):
+        data = book({"1072": group((1072, outcome(1.98, True)), (1073, outcome(1.86, True)))})
+        found = odds_data.find_main_line(data, CATALOG)
+
+        self.assertEqual(found["handicap"], 0.0)
+        self.assertEqual(found["source"], "mainline")
+
+    def test_picks_the_lowest_market_id_when_more_than_one_is_flagged(self):
+        data = book({
+            "1090": group((1090, outcome(2.30, True)), (1091, outcome(1.62, True))),
+            "1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, True))),
+        })
+        found = odds_data.find_main_line(data, CATALOG)
+        self.assertEqual(found["market_ids"]["home"], "1080")
+
+    def test_reads_the_flag_from_string_and_number_forms(self):
+        for raw in (True, "true", "True", 1):
+            data = book({"1080": group((1080, outcome(2.02, raw)), (1081, outcome(1.84, raw)))})
+            self.assertIsNotNone(odds_data.find_main_line(data, CATALOG),
+                                 f"ควรอ่าน mainLine={raw!r} เป็นจริงได้")
+
+    def test_reads_the_flag_when_it_sits_on_the_player_level(self):
+        data = book({"1080": {"outcomes": {
+            "1080": {"players": {"0": {"price": 2.02, "mainLine": True}}},
+            "1081": {"players": {"0": {"price": 1.84, "mainLine": True}}},
+        }}})
+        found = odds_data.find_main_line(data, CATALOG)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["handicap"], -0.75)
+
+    def test_collects_changed_at_stamps_of_the_chosen_line(self):
+        data = book({"1080": group((1080, outcome(2.02, True, "2026-08-26T10:00:00Z")),
+                                   (1081, outcome(1.84, True, "2026-08-26T11:00:00Z")))})
+        stamps = []
+        odds_data.find_main_line(data, CATALOG, stamps)
+
+        self.assertEqual(sorted(stamps),
+                         ["2026-08-26T10:00:00Z", "2026-08-26T11:00:00Z"])
+
+    def test_empty_catalog_finds_nothing(self):
+        data = book({"1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, True)))})
+        self.assertIsNone(odds_data.find_main_line(data, {}))
+        self.assertIsNone(odds_data.find_main_line(data, None))
+
+
+class TestFallbackHandicap(unittest.TestCase):
+    """หา mainLine ไม่เจอ ต้องถอยกลับไปเส้นตายตัวเดิมได้ (fail-safe)"""
+
+    def test_prefers_the_half_ball_line(self):
+        distilled = {"ah_-0.5": {"home": 1.95, "away": 1.90}, "ah_0": {"home": 1.70, "away": 2.15}}
+        found = odds_data.fallback_handicap(distilled)
+
+        self.assertEqual(found["source"], "fallback")
+        self.assertEqual(found["handicap"], -0.5)
+        self.assertEqual((found["home"], found["away"]), (1.95, 1.90))
+        self.assertEqual(found["market_ids"], {"home": "1068", "away": "1069"})
+
+    def test_uses_the_level_line_when_the_half_ball_line_is_incomplete(self):
+        distilled = {"ah_-0.5": {"home": 1.95, "away": None}, "ah_0": {"home": 1.70, "away": 2.15}}
+        found = odds_data.fallback_handicap(distilled)
+
+        self.assertEqual(found["handicap"], 0.0)
+        self.assertEqual((found["home"], found["away"]), (1.70, 2.15))
+        self.assertEqual(found["market_ids"], {"home": "1072", "away": "1073"})
+
+    def test_returns_none_when_neither_fixed_line_is_priced(self):
+        distilled = {"ah_-0.5": {"home": None, "away": None}, "ah_0": {"home": None, "away": None}}
+        self.assertIsNone(odds_data.fallback_handicap(distilled))
+
+
+class TestDistillWithMainLine(unittest.TestCase):
+    """distill_odds ต้องแปะช่อง handicap ให้ทุกเจ้า และบอกที่มาของเส้นไว้ใน notes"""
+
+    def raw(self, markets):
+        return {"pinnacle": book(markets)}
+
+    def test_main_line_wins_over_the_fixed_lines(self):
+        raw = self.raw({
+            "1068": group((1068, outcome(1.95, False)), (1069, outcome(1.90, False))),
+            "1080": group((1080, outcome(2.02, True)), (1081, outcome(1.84, True))),
+        })
+        result = odds_data.distill_odds(raw, CATALOG)
+        handicap = result["books"]["pinnacle"]["handicap"]
+
+        self.assertEqual(handicap["source"], "mainline")
+        self.assertEqual(handicap["handicap"], -0.75)
+        # เส้นตายตัวยังถูกกลั่นไว้เหมือนเดิม ไม่ได้หายไปไหน
+        self.assertEqual(result["books"]["pinnacle"]["ah_-0.5"], {"home": 1.95, "away": 1.90})
+
+    def test_falls_back_and_says_so_in_notes(self):
+        raw = self.raw({"1068": group((1068, outcome(1.95)), (1069, outcome(1.90)))})
+        result = odds_data.distill_odds(raw, CATALOG)
+
+        self.assertEqual(result["books"]["pinnacle"]["handicap"]["source"], "fallback")
+        self.assertTrue(any("mainLine" in note for note in result["notes"]))
+
+    def test_works_without_a_catalog_at_all(self):
+        raw = self.raw({"1068": group((1068, outcome(1.95, True)), (1069, outcome(1.90, True)))})
+        result = odds_data.distill_odds(raw)
+
+        self.assertEqual(result["books"]["pinnacle"]["handicap"]["source"], "fallback")
+
+    def test_notes_when_a_book_has_no_usable_handicap(self):
+        raw = self.raw({"101": group((101, outcome(1.80)), (103, outcome(4.20)))})
+        result = odds_data.distill_odds(raw, CATALOG)
+
+        self.assertIsNone(result["books"]["pinnacle"]["handicap"])
+        self.assertTrue(any("ไม่มีเส้นแฮนดิแคป" in note for note in result["notes"]))
+
+
+class TestHandicapLineLabel(unittest.TestCase):
+    """เทียบเลขเส้นกับ HANDICAP_LINE_NAMES — ไม่ตรงให้บอกตัวเลขเฉย ๆ ห้ามเดาชื่อ"""
+
+    def test_known_lines_get_their_thai_name(self):
+        self.assertEqual(analyze.handicap_line_label(-0.5), "ครึ่งลูก [0.5]")
+        self.assertEqual(analyze.handicap_line_label(0.0), "ต่อเสมอ [0]")
+        self.assertEqual(analyze.handicap_line_label(-1.0), "ลูกเดียว [1]")
+        self.assertEqual(analyze.handicap_line_label(-1.5), "ลูกครึ่ง [1.5]")
+
+    def test_quarter_lines_map_to_the_combined_names(self):
+        self.assertEqual(analyze.handicap_line_label(-0.25), "เสมอควบครึ่ง [0-0.5]")
+        self.assertEqual(analyze.handicap_line_label(-0.75), "ครึ่งควบลูก [0.5-1]")
+        self.assertEqual(analyze.handicap_line_label(-1.25), "ลูกควบลูกครึ่ง [1-1.5]")
+
+    def test_the_sign_does_not_change_the_name(self):
+        self.assertEqual(analyze.handicap_line_label(0.75), analyze.handicap_line_label(-0.75))
+
+    def test_unknown_lines_show_the_number_only(self):
+        self.assertEqual(analyze.handicap_line_label(-3.0), "[3]")
+        self.assertEqual(analyze.handicap_line_label(-2.75), "[2.75]")
+        self.assertEqual(analyze.handicap_line_label(-0.1), "[0.1]")
+
+    def test_non_numeric_input_gives_nothing(self):
+        for value in (None, "0.5", True):
+            self.assertIsNone(analyze.handicap_line_label(value))
+
+    def test_line_number_formatting(self):
+        self.assertEqual(analyze.format_line_number(1.0), "1")
+        self.assertEqual(analyze.format_line_number(0.5), "0.5")
+        self.assertEqual(analyze.format_line_number(0.25), "0.25")
+        self.assertEqual(analyze.format_line_number(0), "0")
+
+    def test_line_giver_reads_the_sign(self):
+        self.assertEqual(analyze.handicap_line_giver(-0.75), "home")
+        self.assertEqual(analyze.handicap_line_giver(0.75), "away")
+        self.assertEqual(analyze.handicap_line_giver(0.0), "level")
+        self.assertIsNone(analyze.handicap_line_giver(None))
+
+
+class TestHandicapFavourite(unittest.TestCase):
+    """handicap_favourite ต้องคิดจากเส้น mainLine ที่เจอจริงก่อน แล้วค่อยถอยไปเส้นเดิม"""
+
+    def test_uses_the_main_line_over_the_fixed_lines(self):
+        distilled = {
+            "handicap": {"home": 1.98, "away": 1.88, "handicap": 0.75, "source": "mainline"},
+            "ah_-0.5": {"home": 1.70, "away": 2.20},   # เส้นเดิมชี้คนละฝั่ง ต้องไม่ถูกใช้
+            "ah_0": {"home": 1.50, "away": 2.60},
+        }
+        self.assertEqual(analyze.handicap_favourite(distilled), "away")
+
+    def test_a_real_main_line_is_read_from_the_line_not_the_price(self):
+        """เจ้าบ้านต่อลูกเดียว ราคา 1.98/1.88 — เทียบราคาดิบจะได้ away ซึ่งกลับข้างกับความจริง"""
+        distilled = {"handicap": {"home": 1.98, "away": 1.88, "handicap": -1.0,
+                                  "source": "mainline"}}
+        self.assertEqual(analyze.handicap_favourite(distilled), "home")
+
+    def test_a_zero_main_line_still_falls_back_to_comparing_prices(self):
+        distilled = {"handicap": {"home": 1.70, "away": 2.20, "handicap": 0.0,
+                                  "source": "mainline"}}
+        self.assertEqual(analyze.handicap_favourite(distilled), "home")
+
+    def test_a_fallback_line_still_compares_prices_like_before(self):
+        """เส้นตายตัวไม่การันตีว่าเป็นเส้นที่ตลาดใช้ เครื่องหมายของมันจึงเชื่อไม่ได้"""
+        distilled = {"handicap": {"home": 2.20, "away": 1.70, "handicap": -0.5,
+                                  "source": "fallback"}}
+        self.assertEqual(analyze.handicap_favourite(distilled), "away")
+
+    def test_falls_back_to_the_fixed_lines_when_there_is_no_main_line(self):
+        distilled = {"handicap": None, "ah_-0.5": {"home": 1.70, "away": 2.20},
+                     "ah_0": {"home": 1.50, "away": 2.60}}
+        self.assertEqual(analyze.handicap_favourite(distilled), "home")
+
+    def test_close_prices_read_as_level(self):
+        distilled = {"handicap": {"home": 1.92, "away": 1.90, "handicap": 0.0,
+                                  "source": "mainline"}}
+        self.assertEqual(analyze.handicap_favourite(distilled), "level")
+
+    def test_no_comparable_price_gives_nothing(self):
+        self.assertIsNone(analyze.handicap_favourite({"handicap": None}))
+        self.assertIsNone(analyze.handicap_favourite(
+            {"handicap": {"home": 1.95, "away": None, "source": "mainline"}}))
+
+
+class TestSummarizeOddsForPrompt(unittest.TestCase):
+    """ข้อมูลที่ส่งเข้า prompt ต้องมีเส้นหลักเส้นเดียว พร้อมเลขเส้นจริงและที่มา"""
+
+    def summary(self, markets, catalog=CATALOG):
+        raw = {"pinnacle": book(markets)}
+        return analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, catalog))
+
+    def test_main_line_reaches_the_prompt_with_thai_prices(self):
+        summary = self.summary({
+            "101": group((101, outcome(1.80)), (102, outcome(3.50)), (103, outcome(4.20))),
+            "1080": group((1080, outcome(1.68, True)), (1081, outcome(2.30, True))),
+        })
+        handicap = summary["handicap"]
+
+        self.assertEqual(handicap["line"], "0.75")
+        self.assertEqual(handicap["line_label"], "ครึ่งควบลูก [0.5-1]")
+        self.assertEqual(handicap["giver"], "home")
+        self.assertEqual(handicap["source"], "mainline")
+        # 1.68 -> 0.68 (เลขบวก) และ 2.30 -> -0.77 (เลขลบ) ตามตรรกะแปลงราคาเดิม
+        self.assertEqual(handicap["prices"], {"home": 0.68, "away": -0.77})
+        self.assertEqual(summary["handicap_favourite"], "home")  # เจ้าบ้านเป็นคนต่อ 0.75
+        self.assertEqual(summary["market_favourite"], "home")
+
+    def test_fallback_is_labelled_as_fallback(self):
+        summary = self.summary({"1068": group((1068, outcome(1.95)), (1069, outcome(1.90)))})
+        handicap = summary["handicap"]
+
+        self.assertEqual(handicap["source"], "fallback")
+        self.assertEqual(handicap["line_label"], "ครึ่งลูก [0.5]")
+
+    def test_unknown_line_reaches_the_prompt_as_a_bare_number(self):
+        catalog = dict(CATALOG, **{"1200": -3.0, "1201": 3.0})
+        summary = self.summary(
+            {"1200": group((1200, outcome(1.90, True)), (1201, outcome(1.94, True)))}, catalog)
+
+        self.assertEqual(summary["handicap"]["line_label"], "[3]")
+        self.assertEqual(summary["handicap"]["line"], "3")
+
+    def test_no_handicap_at_all_leaves_the_field_empty(self):
+        summary = self.summary({"101": group((101, outcome(1.80)), (103, outcome(4.20)))})
+
+        self.assertIsNone(summary["handicap"])
+        self.assertIsNone(summary["handicap_favourite"])
+        self.assertEqual(summary["1x2"]["home"], 1.80)
+
+    def test_book_without_any_price_is_not_chosen(self):
+        raw = {"pinnacle": book({"1080": group((1080, outcome(None, True)),
+                                               (1081, outcome(None, True)))})}
+        self.assertIsNone(analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, CATALOG)))
+
+    def test_prompt_payload_no_longer_carries_the_fixed_lines(self):
+        summary = self.summary({"1068": group((1068, outcome(1.95)), (1069, outcome(1.90)))})
+
+        self.assertNotIn("ah_-0.5", summary)
+        self.assertNotIn("ah_0", summary)
+        self.assertNotIn("handicap_lines", summary)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

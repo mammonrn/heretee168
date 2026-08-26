@@ -10,6 +10,11 @@
     python3 src/test_odds_offline.py path/to/other.json
     python3 src/test_odds_offline.py --leagues          # ดูรายชื่อลีกจากรายการคู่ที่แคชไว้ใน cache.db
                                                         # (ไว้ตรวจว่ามีลีกจำลอง/แปลก ๆ หลุดตัวกรองไหม)
+
+รายงานจะบอกด้วยว่าแต่ละเจ้าเปิดเส้นแฮนดิแคปอะไรบ้าง และปักธง mainLine ไว้เส้นไหน
+ใช้ตรวจกับ response จริงได้ว่าเราอ่านธง mainLine ถูกที่ถูกชั้นหรือเปล่า
+สารบัญ market อ่านจาก cache.db ถ้ามี ไม่มีก็ใช้ตัวสำรองในโค้ด — ไม่ยิง API ทั้งสองทาง
+(ตัวสำรองมีแค่เส้น -0.5 ถึง +0.5 เส้นอื่นจะไม่ถูกมองว่าเป็น AH จนกว่าจะมีสารบัญจริงในแคช)
 """
 
 import json
@@ -19,6 +24,7 @@ from pathlib import Path
 
 import cache_db
 from odds_data import (
+    FALLBACK_AH_CATALOG,
     MARKET_1X2_AWAY,
     MARKET_1X2_DRAW,
     MARKET_1X2_HOME,
@@ -26,12 +32,16 @@ from odds_data import (
     MARKET_AH_0_HOME,
     MARKET_AH_M05_AWAY,
     MARKET_AH_M05_HOME,
+    MARKET_CATALOG_CACHE_KEY,
+    MARKET_CATALOG_TTL,
     MARKET_OU25_OVER,
     MARKET_OU25_UNDER,
     PANEL_BOOKS,
     build_market_index,
     distill_odds,
     is_simulated_fixture,
+    main_line_flag,
+    market_groups,
 )
 from api_football import fail
 
@@ -84,6 +94,57 @@ def report_index(book_odds):
         available = [label for label, market_id in WATCHED_MARKETS if str(market_id) in index]
         print(f"  {slug:<12} market ทั้งหมดใน index: {len(index)}")
         print(f"  {'':<12} ที่เราใช้: {', '.join(available) if available else 'ไม่มีสักอัน'}")
+
+
+def offline_catalog():
+    """
+    สารบัญ market สำหรับโหมดออฟไลน์ — อ่านจาก cache.db ก่อน ไม่มีค่อยใช้สารบัญสำรอง
+    ห้ามยิง API เด็ดขาด ทั้งไฟล์นี้ต้องรันได้โดยไม่กินโควตาสักครั้ง
+    """
+    try:
+        cache_db.init_db()
+        cached = cache_db.get_odds(MARKET_CATALOG_CACHE_KEY, MARKET_CATALOG_TTL)
+        if cached is not None and isinstance(cached["payload"], dict) and cached["payload"]:
+            print(f"สารบัญ market: อ่านจากแคช {len(cached['payload'])} รายการ"
+                  f" (ดึงเมื่อ {cached['created_at']})")
+            return {str(k): v for k, v in cached["payload"].items()}
+    except Exception as exc:
+        print(f"อ่านสารบัญ market จากแคชไม่ได้ ({exc})")
+
+    print(f"สารบัญ market: ใช้ตัวสำรองในโค้ด {len(FALLBACK_AH_CATALOG)} รายการ"
+          " (ยังไม่เคยดึง /markets ลงแคช)")
+    return dict(FALLBACK_AH_CATALOG)
+
+
+def report_main_lines(book_odds, catalog):
+    """
+    ไล่ดูว่าแต่ละเจ้าเปิดเส้นแฮนดิแคปอะไรบ้าง และปักธง mainLine ไว้ที่เส้นไหน
+    เป็นจุดที่ใช้ตรวจกับ response จริงได้ตรงที่สุดว่าเราอ่านธง mainLine ถูกไหม
+    """
+    print("-" * 70)
+    print("เส้นแฮนดิแคปที่แต่ละเจ้าเปิด และธง mainLine")
+    print("-" * 70)
+
+    for wanted in PANEL_BOOKS:
+        slug = next((s for s in sorted(book_odds) if wanted in s.lower()), None)
+        if slug is None:
+            print(f"  {wanted:<12} ไม่มีเจ้านี้ในคู่นี้")
+            continue
+
+        rows = []
+        for _, mapping in market_groups(book_odds[slug]):
+            for market_id, outcome in sorted(mapping.items()):
+                if market_id not in catalog:
+                    continue
+                flag = main_line_flag(outcome)
+                mark = {True: "  <== mainLine", False: "", None: "  (ไม่มีฟิลด์ mainLine)"}[flag]
+                value = catalog[market_id]
+                shown = f"{value:+g}" if value else "0"  # กัน "+0" ที่อ่านแล้วสะดุด
+                rows.append(f"  {'':<12} market {market_id} handicap {shown}{mark}")
+
+        print(f"  {slug:<12} AH markets ที่เจอ: {len(rows)}")
+        for row in rows or [f"  {'':<12} ไม่มีเส้นแฮนดิแคปที่อยู่ในสารบัญเลย"]:
+            print(row)
 
 
 def report_leagues():
@@ -142,21 +203,34 @@ def main():
 
     report_index(book_odds)
 
-    result = distill_odds(book_odds)
+    catalog = offline_catalog()
+    print()
+    report_main_lines(book_odds, catalog)
+
+    result = distill_odds(book_odds, catalog)
     print()
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     # นับว่าอ่านราคาได้กี่ช่อง — ถ้าเป็น 0 แปลว่าโครงสร้างเปลี่ยนอีก
     counter = Counter()
+    price_fields = ("home", "draw", "away", "over", "under")
     for book in result["books"].values():
         for market, prices in book.items():
-            if isinstance(prices, dict):
-                for value in prices.values():
+            if market == "handicap" or not isinstance(prices, dict):
+                continue  # ช่อง handicap มีข้อมูลประกอบปนอยู่ นับรวมแล้วตัวเลขจะเพี้ยน
+            for field, value in prices.items():
+                if field in price_fields:
                     counter["มีราคา" if value is not None else "ว่าง"] += 1
 
     print()
     print("=" * 70)
     print(f"อ่านราคาได้ {counter['มีราคา']} ช่อง / ว่าง {counter['ว่าง']} ช่อง")
+
+    sources = Counter((book.get("handicap") or {}).get("source", "ไม่มีเส้นเลย")
+                      for book in result["books"].values())
+    if sources:
+        print("ที่มาของเส้นแฮนดิแคปที่จะเอาไปพูด: "
+              + ", ".join(f"{name} {count} เจ้า" for name, count in sources.most_common()))
     if counter["มีราคา"] == 0:
         print("[!] ยังอ่านไม่ได้เลย — เปิดไฟล์ดูโครงสร้างใหม่ได้ทันทีโดยไม่ต้องยิง API ซ้ำ")
     print("ยิง API ไป 0 ครั้ง (อ่านจากไฟล์ล้วน)")

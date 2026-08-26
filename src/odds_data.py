@@ -7,10 +7,12 @@ Phase 5A — โมดูลดึง / จับคู่ / กลั่นข�
     fetch_oddspapi_fixtures()  ดึงรายการคู่ที่มีราคา (1 request ต่อช่วงวัน)
     match_fixture()            จับคู่ fixture ของ API-SPORTS เข้ากับของ OddsPapi
     fetch_odds()               ดึงราคาของคู่นั้น
+    fetch_market_catalog()     สารบัญ market id -> เลขเส้นแฮนดิแคป (แคช 7 วัน)
+    find_main_line()           หาเส้นแฮนดิแคปหลักที่ตลาดใช้จริงจากธง mainLine
     distill_odds()             กลั่น bookmakerOdds ดิบให้เหลือเฉพาะที่ใช้วิเคราะห์ได้
-    get_match_odds()           รวมสามขั้นข้างบนให้เรียกทีเดียว
+    get_match_odds()           รวมทุกขั้นข้างบนให้เรียกทีเดียว
 
-ทดสอบเอง (ยิง API 2 ครั้ง):
+ทดสอบเอง (ยิง API ไม่เกิน 3 ครั้ง — ครั้งที่ 3 คือสารบัญ market ซึ่งแคชไว้ 7 วัน):
     python3 src/odds_data.py                       # ใช้คู่ตัวอย่างที่ hardcode ไว้
     python3 src/odds_data.py "Real Madrid" "Barcelona"
 """
@@ -48,6 +50,37 @@ MARKET_AH_0_HOME = 1072  # Asian Handicap 0 (เสมอคืนทุน)
 MARKET_AH_0_AWAY = 1073
 MARKET_OU25_OVER = 1010  # Over/Under 2.5
 MARKET_OU25_UNDER = 1011
+
+# ---- สารบัญ market ของแฮนดิแคป (Asian Handicap) ----
+# เส้นแฮนดิแคปมี market id แยกกันทุกเส้น จะไปฮาร์ดโค้ดให้ครบทุกเส้นไม่ไหว
+# จึงดึงสารบัญทั้งหมดจาก GET /v4/markets?sportId=10 แล้วแคชไว้ยาว ๆ (ดู fetch_market_catalog)
+MARKETS_ENDPOINT = "markets"
+MARKET_CATALOG_CACHE_KEY = f"oddspapi_markets:{SPORT_ID}"
+MARKET_CATALOG_TTL = 7 * 24 * 60 * 60  # 7 วัน — สารบัญ market แทบไม่เปลี่ยน ยิงบ่อยก็เปลืองโควตาเปล่า
+
+# ชื่อ market ที่ถือว่าเป็นแฮนดิแคปเอเชียแบบ "เต็มเวลา"
+# ยังไม่เคยเห็น response จริงของ /v4/markets จึงรับทั้งชื่อเต็มและตัวย่อ "AH -0.5"
+AH_NAME_HINTS = ("asian handicap", "handicap asian")
+AH_NAME_ABBREVIATION = re.compile(r"^ah[\s:_-]")
+# คำที่เจอในชื่อ market แล้วต้องตัดทิ้ง — เป็นแฮนดิแคปคนละแบบหรือคนละช่วงเวลา
+# (แฮนดิแคปยุโรปเป็นแบบ 3 ทาง คนละเรื่องกับเอเชีย ส่วนครึ่งแรก/คอร์เนอร์/ใบเหลืองก็คนละตลาด)
+AH_NAME_BLOCKERS = ("european", "3-way", "3 way", "three way", "corner", "card", "booking",
+                    "half", "1st", "2nd", "first ", "second ", "period", "extra time",
+                    "overtime", "penalt", "shot", "foul", "offside")
+
+# สารบัญสำรอง ใช้เมื่อ /v4/markets เรียกไม่ได้ (โควตาหมด/เน็ตล่ม/โครงสร้างเปลี่ยน)
+# ค่าที่ยืนยันแล้วจากของจริง: 1068 = AH -0.5, 1070 = AH -0.25, 1072 = AH 0,
+#                            1074 = AH +0.25, 1076 = AH +0.5  (ทั้งหมดเป็นตัวเลขฝั่งเหย้า)
+# ส่วน id เลขคี่คือฝั่งเยือนของคู่เดียวกัน (1068 คู่กับ 1069 ตามที่เห็นใน raw response จริง)
+# ค่า handicap ของฝั่งเยือนในตารางนี้ใส่แบบกลับเครื่องหมายไว้เฉย ๆ ยังไม่เคยยืนยันกับของจริง
+# แต่ไม่กระทบผลลัพธ์ เพราะเลขเส้นที่เอาไปแสดงอ่านจากฝั่งเหย้าเสมอ (ดู find_main_line)
+FALLBACK_AH_CATALOG = {
+    "1068": -0.5, "1069": 0.5,
+    "1070": -0.25, "1071": 0.25,
+    "1072": 0.0, "1073": 0.0,
+    "1074": 0.25, "1075": -0.25,
+    "1076": 0.5, "1077": -0.5,
+}
 
 # เจ้ามือที่สนใจ — แก้ตรงนี้จุดเดียวถ้าอยากเพิ่ม/ลด
 ASIAN_BOOKS = ("sbobet", "singbet", "singbet-b")
@@ -209,6 +242,130 @@ def as_list(payload, *keys):
             if isinstance(value, list):
                 return value
     return []
+
+
+# ---------- สารบัญ market (ไว้แปลง market id เป็นเลขเส้นแฮนดิแคป) ----------
+
+
+def parse_handicap_value(raw):
+    """
+    แปลงค่า handicap ที่ API ส่งมาเป็น float — รองรับทั้งตัวเลขและสตริง ("-0.5", "+0.25", "0")
+    ค่าที่แปลงไม่ได้คืน None (จะได้ข้าม market นั้นไปเงียบ ๆ ไม่ทำให้พัง)
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+
+    text = str(raw).strip().replace("+", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def is_asian_handicap_market(name):
+    """
+    ชื่อ market นี้เป็นแฮนดิแคปเอเชียแบบเต็มเวลาไหม
+
+    หมายเหตุ: ยังไม่เคยเห็น response จริงของ /v4/markets จึงกรองแบบ "เข้มไว้ก่อน" —
+    ต้องมีคำว่า Asian Handicap และต้องไม่มีคำที่บอกว่าเป็นคนละตลาด/คนละช่วงเวลา
+    (ครึ่งแรก คอร์เนอร์ ใบเหลือง แฮนดิแคปยุโรป ฯลฯ) เพราะถ้าหลุดเข้ามาแล้วมันดัน mainLine
+    บอทจะพูดเลขเส้นผิดทันที ยอมกรองทิ้งเกินดีกว่าปล่อยเส้นผิดผ่าน
+    """
+    text = (name or "").strip().lower()
+    if not text:
+        return False
+    if not any(hint in text for hint in AH_NAME_HINTS) and not AH_NAME_ABBREVIATION.match(text):
+        return False
+    return not any(blocker in text for blocker in AH_NAME_BLOCKERS)
+
+
+def parse_market_catalog(payload):
+    """
+    แปลง response ของ /v4/markets เป็น dict {market id (str): handicap (float)}
+    เก็บเฉพาะ Asian Handicap เต็มเวลาที่มีเลข handicap จริง ๆ
+    """
+    catalog = {}
+
+    for entry in as_list(payload, "markets"):
+        if not isinstance(entry, dict):
+            continue
+
+        market_id = entry.get("marketId", entry.get("id"))
+        if market_id is None:
+            continue
+        if not is_asian_handicap_market(entry.get("marketName") or entry.get("name")):
+            continue
+
+        handicap = parse_handicap_value(entry.get("handicap"))
+        if handicap is None:
+            continue
+
+        catalog[str(market_id)] = handicap
+
+    return catalog
+
+
+_market_catalog_cache = {"map": None}
+
+
+def fetch_market_catalog(api_key=None, counter=None, force=False):
+    """
+    ดึงสารบัญ market ทั้งหมดของฟุตบอล (GET /v4/markets?sportId=10)
+    คืน dict {market id (str): handicap (float)} เฉพาะ Asian Handicap เต็มเวลา
+
+    ทำไมถึงไม่กินโควตา: สารบัญ market แทบไม่เปลี่ยน จึงแคชไว้ 7 วัน (MARKET_CATALOG_TTL)
+    ทั้งในหน่วยความจำและใน cache.db — ต่อการวิเคราะห์หนึ่งคู่จึงไม่ยิงเพิ่มเลยแทบทุกครั้ง
+
+    fail-safe เสมอ: ยิงไม่ได้/โครงสร้างเปลี่ยน/โควตาหมด -> คืน FALLBACK_AH_CATALOG
+    (เท่าที่ยืนยันแล้ว) ไม่โยน error ออกไปให้การวิเคราะห์ล้ม
+    """
+    if not force and _market_catalog_cache["map"] is not None:
+        return _market_catalog_cache["map"]
+
+    if not force:
+        try:
+            cache_db.init_db()
+            cached = cache_db.get_odds(MARKET_CATALOG_CACHE_KEY, MARKET_CATALOG_TTL)
+            if cached is not None and isinstance(cached["payload"], dict):
+                catalog = {str(k): v for k, v in cached["payload"].items()
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)}
+                if catalog:
+                    logger.info("ใช้สารบัญ market จากแคช (%d AH markets, ดึงเมื่อ %s)",
+                                len(catalog), cached["created_at"])
+                    _market_catalog_cache["map"] = catalog
+                    return catalog
+        except Exception as exc:  # แคชพังไม่ควรทำให้ดึงสารบัญไม่ได้
+            logger.warning("อ่านแคชสารบัญ market ไม่ได้ (%s) — จะยิงใหม่", exc)
+
+    try:
+        payload = api_get(MARKETS_ENDPOINT, {"sportId": SPORT_ID},
+                          api_key=api_key, counter=counter)
+        catalog = parse_market_catalog(payload)
+    except SystemExit as exc:  # api_get ใช้ fail() ที่เรียก sys.exit
+        logger.warning("ดึงสารบัญ market ไม่สำเร็จ (exit code=%s) — ใช้สารบัญสำรอง", exc.code)
+        catalog = {}
+    except Exception as exc:
+        logger.warning("ดึงสารบัญ market ไม่สำเร็จ (%s) — ใช้สารบัญสำรอง", exc)
+        catalog = {}
+
+    if not catalog:
+        logger.warning("สารบัญ market จาก /%s ว่างเปล่าหรือเรียกไม่ได้ — ใช้สารบัญสำรอง %d รายการ",
+                       MARKETS_ENDPOINT, len(FALLBACK_AH_CATALOG))
+        catalog = dict(FALLBACK_AH_CATALOG)
+    else:
+        logger.info("ดึงสารบัญ market ใหม่: เจอ AH markets %d รายการ", len(catalog))
+        try:
+            cache_db.init_db()
+            cache_db.save_odds(MARKET_CATALOG_CACHE_KEY, catalog)
+        except Exception as exc:  # เขียนแคชไม่ได้ก็แค่ยิงใหม่รอบหน้า
+            logger.warning("เก็บสารบัญ market ลงแคชไม่สำเร็จ (%s)", exc)
+
+    _market_catalog_cache["map"] = catalog
+    return catalog
 
 
 def fetch_oddspapi_fixtures(dates, api_key=None, counter=None):
@@ -692,8 +849,218 @@ def price_of(market_index, market_id, changed_stamps):
     return outcome_price(outcome)
 
 
-def distill_book(book_data):
-    """กลั่นราคาของเจ้ามือหนึ่งเจ้าให้เหลือเฉพาะ market ที่ใช้วิเคราะห์"""
+# ---------- หาเส้นแฮนดิแคปหลักที่ตลาดใช้จริง (mainLine) ----------
+
+# ชื่อฟิลด์ที่อาจใช้บอกว่า outcome นี้คือเส้นหลัก — ยืนยันมาแล้วว่าใช้ "mainLine"
+# ที่เผื่อชื่ออื่นไว้เพราะ OddsPapi เคยเปลี่ยนโครงสร้างมาแล้ว และของถูกก็ยังถูกอยู่ดี
+MAIN_LINE_FIELDS = ("mainLine", "mainline", "main_line", "isMainLine")
+
+
+def flag_value(raw):
+    """แปลงค่าที่อ่านได้เป็น True/False — รองรับทั้ง bool, "true"/"false" และ 0/1"""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "1", "yes", "y")
+    return None
+
+
+def flag_from_dict(data):
+    """อ่าน mainLine จาก dict ใบเดียว — ไม่มีฟิลด์เลยคืน None (ต่างจาก False)"""
+    if not isinstance(data, dict):
+        return None
+    for field in MAIN_LINE_FIELDS:
+        if field in data:
+            return flag_value(data[field])
+    return None
+
+
+def main_line_flag(outcome):
+    """
+    outcome นี้เป็นเส้นหลักไหม — คืน True/False ตามที่ API บอก, None เมื่อไม่มีฟิลด์ mainLine เลย
+
+    ไล่หาสามชั้น (ระดับ outcome -> ระดับที่แกะ outcomes แล้ว -> ในแต่ละ player)
+    เพราะยืนยันมาแค่ว่า "ทุก outcome มีฟิลด์ mainLine" แต่ยังไม่ได้ยืนยันว่าอยู่ชั้นไหนแน่
+    """
+    direct = flag_from_dict(outcome)
+    if direct is not None:
+        return direct
+
+    inner = unwrap_outcome(outcome)
+    if inner is not outcome:
+        nested = flag_from_dict(inner)
+        if nested is not None:
+            return nested
+    else:
+        inner = outcome
+
+    players = inner.get("players") if isinstance(inner, dict) else None
+    if isinstance(players, dict):
+        for player in players.values():
+            value = flag_from_dict(player)
+            if value is not None:
+                return value
+
+    return None
+
+
+def market_groups(book_data):
+    """
+    คืน list ของ (คีย์กลุ่ม, {market id: outcome}) ตามที่ OddsPapi จัดกลุ่มมา
+
+    ต่างจาก build_market_index ตรงที่ "ไม่แบนราบ" — เก็บไว้ว่า market id ไหนอยู่กลุ่มเดียวกัน
+    ซึ่งจำเป็นสำหรับแฮนดิแคป เพราะฝั่งเหย้ากับฝั่งเยือนของเส้นเดียวกันอยู่กลุ่มเดียวกันเสมอ
+    (ของจริง: markets["1068"]["outcomes"] = {"1068": ..., "1069": ...})
+    """
+    groups = []
+
+    for key, entry in market_entries(book_data):
+        outcomes = entry.get("outcomes") if isinstance(entry, dict) else None
+        mapping = {}
+
+        if isinstance(outcomes, dict):
+            if "players" in outcomes:
+                if key is not None:
+                    mapping[str(key)] = outcomes
+            else:
+                for outcome_id, outcome in outcomes.items():
+                    mapping[str(outcome_id)] = outcome
+        elif isinstance(outcomes, list):
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                outcome_id = outcome.get("outcomeId", outcome.get("marketId", outcome.get("id")))
+                mapping[str(outcome_id if outcome_id is not None else key)] = outcome
+        elif key is not None:
+            mapping[str(key)] = entry
+
+        if mapping:
+            groups.append((str(key) if key is not None else None, mapping))
+
+    return groups
+
+
+def market_id_sort_key(market_id):
+    """เรียง market id แบบตัวเลขก่อน (ตัวเลขมาก่อนตัวอักษร) — id ฝั่งเหย้าน้อยกว่าฝั่งเยือนเสมอ"""
+    text = str(market_id)
+    return (0, int(text), "") if text.lstrip("-").isdigit() else (1, 0, text)
+
+
+def find_main_line(book_data, catalog, stamps=None):
+    """
+    สแกน AH market ทั้งหมดที่เจ้ามือเจ้านี้เสนอ แล้วหาเส้นที่ mainLine=true ทั้งสองฝั่ง
+
+    เกณฑ์ครบทุกข้อถึงจะรับ:
+      ก. กลุ่มนั้นมี market id ที่อยู่ในสารบัญ AH พอดีสองตัว (= ฝั่งเหย้ากับฝั่งเยือนของเส้นเดียวกัน)
+      ข. ทั้งสองฝั่ง mainLine=true (ฝั่งเดียวไม่พอ เดี๋ยวได้เส้นครึ่ง ๆ กลาง ๆ)
+      ค. ทั้งสองฝั่งมีราคาจริงเป็นตัวเลข (ขาดฝั่งใดฝั่งหนึ่งเอาไปเทียบว่าใครต่อไม่ได้)
+
+    เลขเส้นอ่านจากฝั่งเหย้า (market id น้อยกว่า) เสมอ ตามที่ยืนยันจากของจริง
+    (1068 = AH -0.5 คู่กับ 1069, 1072 = AH 0 คู่กับ 1073)
+
+    คืน dict ของเส้นหลัก หรือ None ถ้าไม่เจอ (ให้ปลายทาง fallback ไปเส้นตายตัว)
+    """
+    catalog = catalog or {}
+    candidates = []
+
+    for _, mapping in market_groups(book_data):
+        ah_ids = [market_id for market_id in mapping if market_id in catalog]
+        if len(ah_ids) != 2:
+            continue
+
+        home_id, away_id = sorted(ah_ids, key=market_id_sort_key)
+        home_outcome, away_outcome = mapping[home_id], mapping[away_id]
+
+        if not (main_line_flag(home_outcome) and main_line_flag(away_outcome)):
+            continue
+
+        home_price = outcome_price(unwrap_outcome(home_outcome))
+        away_price = outcome_price(unwrap_outcome(away_outcome))
+        numeric = [isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for value in (home_price, away_price)]
+        if not all(numeric):
+            logger.info("เจอเส้นหลัก (market %s/%s) แต่ราคาไม่ครบสองฝั่ง — ข้ามไปใช้เส้นสำรอง",
+                        home_id, away_id)
+            continue
+
+        handicap = catalog[home_id]
+        candidates.append({
+            "home": home_price,
+            "away": away_price,
+            "handicap": handicap,
+            "line": abs(handicap),
+            "source": "mainline",
+            "market_ids": {"home": home_id, "away": away_id},
+            "outcomes": (home_outcome, away_outcome),
+        })
+
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        found = ", ".join(item["market_ids"]["home"] for item in candidates)
+        logger.warning("เจอเส้นหลักมากกว่าหนึ่งเส้น (market %s) — เลือกอันแรกตาม market id", found)
+
+    chosen = min(candidates, key=lambda item: market_id_sort_key(item["market_ids"]["home"]))
+    outcomes = chosen.pop("outcomes")
+
+    if stamps is not None:
+        for outcome in outcomes:
+            stamp = outcome_changed_at(outcome) or outcome_changed_at(unwrap_outcome(outcome))
+            if stamp:
+                stamps.append(stamp)
+
+    logger.info("เส้นหลักของเจ้านี้: handicap=%s (market %s/%s) ราคา %s / %s",
+                chosen["handicap"], chosen["market_ids"]["home"], chosen["market_ids"]["away"],
+                chosen["home"], chosen["away"])
+    return chosen
+
+
+# เส้นตายตัวที่ใช้เป็นตัวสำรองเมื่อหา mainLine ไม่เจอ — เรียงตามลำดับที่อยากได้ก่อน
+# (คีย์ใน book ที่กลั่นแล้ว, เลข handicap ฝั่งเหย้า, market id ฝั่งเหย้า, market id ฝั่งเยือน)
+FALLBACK_HANDICAP_MARKETS = (
+    ("ah_-0.5", -0.5, MARKET_AH_M05_HOME, MARKET_AH_M05_AWAY),
+    ("ah_0", 0.0, MARKET_AH_0_HOME, MARKET_AH_0_AWAY),
+)
+
+
+def fallback_handicap(book):
+    """
+    หา mainLine ไม่เจอ ก็ถอยกลับไปใช้เส้นตายตัวเดิม (AH -0.5 ก่อน ไม่มีค่อย AH 0)
+    ต้องมีราคาครบสองฝั่งถึงจะใช้ได้ — คืน None ถ้าไม่มีเส้นไหนใช้ได้เลย
+
+    ผลที่คืนหน้าตาเหมือนของ find_main_line ทุกอย่าง ต่างแค่ source = "fallback"
+    ปลายทางจะได้รู้ว่านี่ "ไม่ใช่" เส้นหลักที่ตลาดใช้จริง ห้ามพูดว่าคู่นี้ตลาดตั้งต่อเท่านี้
+    """
+    for market, handicap, home_id, away_id in FALLBACK_HANDICAP_MARKETS:
+        prices = book.get(market) or {}
+        home, away = prices.get("home"), prices.get("away")
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for value in (home, away)):
+            continue
+
+        return {
+            "home": home,
+            "away": away,
+            "handicap": handicap,
+            "line": abs(handicap),
+            "source": "fallback",
+            "market_ids": {"home": str(home_id), "away": str(away_id)},
+        }
+
+    return None
+
+
+def distill_book(book_data, catalog=None):
+    """
+    กลั่นราคาของเจ้ามือหนึ่งเจ้าให้เหลือเฉพาะ market ที่ใช้วิเคราะห์
+
+    ช่อง "handicap" คือเส้นแฮนดิแคปที่จะเอาไปพูดจริง — หาเส้นหลักที่ตลาดใช้ ณ ขณะนั้น
+    จาก mainLine ก่อน หาไม่เจอค่อยถอยไปเส้นตายตัวเดิม (ดู find_main_line / fallback_handicap)
+    ส่วน ah_-0.5 / ah_0 ยังเก็บไว้เหมือนเดิม เผื่อไว้ตรวจสอบและเป็นตัวสำรอง
+    """
     index = build_market_index(book_data)  # ทำครั้งเดียวต่อเจ้า แล้วใช้ซ้ำทุก market
     stamps = []
 
@@ -717,14 +1084,19 @@ def distill_book(book_data):
         },
     }
 
+    book["handicap"] = find_main_line(book_data, catalog, stamps) or fallback_handicap(book)
+
     book["changed_at"] = max(stamps) if stamps else None
     return book
 
 
-def distill_odds(raw_odds):
+def distill_odds(raw_odds, catalog=None):
     """
     กลั่น bookmakerOdds ดิบให้เหลือเฉพาะเจ้าใน PANEL_BOOKS และ market ที่ใช้จริง
     market ไหนเจ้านั้นไม่มี จะเป็น None ไม่ทำให้พัง
+
+    catalog คือสารบัญ {market id: handicap} จาก fetch_market_catalog() ใช้หาเส้นหลัก
+    ไม่ส่งมาก็ยังทำงานได้ แค่จะหา mainLine ไม่เจอแล้วถอยไปใช้เส้นตายตัวแทน
     """
     raw_odds = raw_odds if isinstance(raw_odds, dict) else {}
     slugs = sorted(raw_odds)
@@ -737,13 +1109,19 @@ def distill_odds(raw_odds):
             notes.append(f"ไม่มีราคาจาก {wanted}")
             continue
 
-        book = distill_book(raw_odds[slug])
+        book = distill_book(raw_odds[slug], catalog)
         books[slug] = book
 
         missing = [market for market in ("1x2", "ah_-0.5", "ah_0")
                    if all(value is None for value in book[market].values())]
         if missing:
             notes.append(f"{slug} ไม่มี market: {', '.join(missing)}")
+
+        handicap = book.get("handicap")
+        if handicap is None:
+            notes.append(f"{slug} ไม่มีเส้นแฮนดิแคปที่ใช้ได้เลย")
+        elif handicap.get("source") == "fallback":
+            notes.append(f"{slug} หาเส้นหลัก (mainLine) ไม่เจอ — ใช้เส้นตายตัวแทน")
 
     asian_found = [s for s in slugs if any(name in s.lower() for name in ASIAN_BOOKS)]
 
@@ -769,7 +1147,9 @@ def get_match_odds(home_name, away_name, kickoff_iso, league_hint, oddspapi_fixt
         return None
 
     raw = fetch_odds(fixture_id, api_key=api_key, counter=counter)
-    distilled = distill_odds(raw)
+    # สารบัญ market แคชไว้ 7 วัน จึงแทบไม่ยิง API เพิ่มต่อการวิเคราะห์หนึ่งคู่
+    catalog = fetch_market_catalog(api_key=api_key, counter=counter)
+    distilled = distill_odds(raw, catalog)
     distilled["oddspapi_fixture_id"] = fixture_id
     distilled["match"] = f"{home_name} vs {away_name}"
     return distilled
@@ -786,7 +1166,8 @@ def main():
     away_name = args[1] if len(args) > 1 else "Barcelona"
 
     api_key = get_api_key()
-    counter = RequestCounter(limit=2)
+    # 3 ครั้ง = /fixtures + /odds + /markets (อันหลังยิงแค่รอบแรก จากนั้นอ่านจากแคช 7 วัน)
+    counter = RequestCounter(limit=3)
 
     tz = get_bangkok_tz()
     today = datetime.now(tz).date()
