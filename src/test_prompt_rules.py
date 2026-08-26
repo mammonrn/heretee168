@@ -148,8 +148,57 @@ class TestBothSidesRule(unittest.TestCase):
     def test_the_two_number_budget_still_holds(self):
         self.assertIn("ไม่เกินสองตัว", self.odds)
 
-    def test_one_sided_prices_fall_back_to_1x2(self):
-        self.assertIn("เป็น null ให้ถือว่าราคาต่อรองใช้ไม่ได้", self.odds)
+    def test_one_sided_prices_disqualify_that_market(self):
+        self.assertIn("เป็น null ให้ถือว่าตลาดนั้นใช้ไม่ได้", self.odds)
+
+
+class TestTotalsRules(unittest.TestCase):
+    """เส้นสูง/ต่ำ — เรียกตรง ๆ ยกสองฝั่ง และอยู่ใต้กฎเดียวกับราคาต่อรอง"""
+
+    def setUp(self):
+        self.odds = section("ราคาต่อรอง")
+
+    def test_the_total_block_is_documented(self):
+        for field in ("total.line", "total.prices", "total.source"):
+            self.assertIn(field, self.odds, f"prompt ต้องอธิบาย {field}")
+
+    def test_the_line_is_spoken_plainly_without_a_made_up_name(self):
+        self.assertIn("ไม่มีชื่อไทยพิเศษ", self.odds)
+        self.assertIn("สูง/ต่ำ 3.5", self.odds)
+
+    def test_square_brackets_stay_reserved_for_the_handicap(self):
+        self.assertIn("วงเล็บเหลี่ยมสงวนไว้ให้เลขเส้นแฮนดิแคปเท่านั้น", self.odds)
+
+    def test_totals_must_quote_both_sides(self):
+        example = next(line for line in self.odds.splitlines()
+                       if line.strip().startswith("เขียนว่า") and "สูง/ต่ำ" in line)
+
+        self.assertIn("ฝั่งสูง", example)
+        self.assertIn("ฝั่งต่ำ", example)
+        self.assertEqual(len(re.findall(r"-?\d+(?:\.\d+)?", example)), 3,
+                         "ตัวอย่างต้องมีเลขเส้นหนึ่งตัวและราคาสองฝั่ง")
+
+    def test_the_market_intent_ban_covers_totals(self):
+        self.assertIn("ใช้กับเส้นสูง/ต่ำด้วยทุกข้อ", self.odds)
+
+    def test_the_number_budget_scales_with_how_many_markets_exist(self):
+        self.assertIn("มีตลาดเดียว", self.odds)
+        self.assertIn("ไม่เกินสองตัว", self.odds)
+        self.assertIn("ไม่เกินสี่ตัว", self.odds)
+
+    def test_line_numbers_do_not_count_against_the_budget(self):
+        self.assertIn("ไม่นับเป็นตัวเลขราคา", self.odds)
+
+    def test_the_six_line_limit_is_untouched(self):
+        self.assertIn("ไม่เกิน 6 บรรทัด", self.odds)
+
+    def test_a_worked_example_shows_a_total_in_a_full_sentence(self):
+        examples = [line for line in self.odds.splitlines()
+                    if "✅" in line and "สูง/ต่ำ" in line]
+        self.assertTrue(examples, "ต้องมีตัวอย่าง ✅ ที่ใช้เส้นสูง/ต่ำ")
+        for line in examples:
+            self.assertTrue("ฝั่งสูง" in line and "ฝั่งต่ำ" in line,
+                            f"ตัวอย่างสูง/ต่ำยกฝั่งเดียว: {line.strip()}")
 
 
 class TestExamplesStayConsistent(unittest.TestCase):

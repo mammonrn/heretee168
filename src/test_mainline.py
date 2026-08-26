@@ -25,16 +25,19 @@ import test_odds_offline
 # ---------- ตัวช่วยสร้างข้อมูลจำลอง ----------
 
 
-def outcome(price, main_line=None, changed_at=None):
+def outcome(price, main_line=None, changed_at=None, outcome_id=None):
     """
     outcome หนึ่งช่องตามโครงสร้างจริงที่ยืนยันแล้ว:
         {"players": {"0": {"price": ..., "mainLine": ...}}}
     ทั้งราคาและธง mainLine อยู่ใน dict ใบเดียวกันคือ players["0"]
     main_line=None แปลว่าไม่มีฟิลด์ mainLine เลย
+    outcome_id คือ bookmakerOutcomeId เช่น "3.5/over" ซึ่งอยู่ใน dict ใบเดียวกันกับราคา
     """
     player = {"price": price}
     if main_line is not None:
         player["mainLine"] = main_line
+    if outcome_id is not None:
+        player["bookmakerOutcomeId"] = outcome_id
 
     data = {"players": {"0": player}}
     if changed_at is not None:
@@ -219,6 +222,16 @@ REAL_PINNACLE_MARKETS = {
 }
 
 
+# raw response จริงของตลาดสูง/ต่ำบน VPS — 2.5 ไม่ใช่เส้นหลักแล้ว เส้นหลักจริงคือ 3.5
+# เลขเส้นฝังอยู่ใน bookmakerOutcomeId ตรง ๆ จึงไม่ต้องพึ่งสารบัญ market เลย
+REAL_TOTAL_MARKETS = {
+    "1010": group((1010, outcome(1.55, False, outcome_id="2.5/over")),
+                  (1011, outcome(2.45, False, outcome_id="2.5/under"))),
+    "1012": group((1012, outcome(2.02, True, outcome_id="3.5/over")),
+                  (1013, outcome(1.83, True, outcome_id="3.5/under"))),
+}
+
+
 class TestRealPinnacleSample(unittest.TestCase):
     """
     เคสหลัก: ข้อมูลจริงจาก VPS ที่เคยพัง — ต้องได้เส้น -1.75 และต้องไม่ fallback
@@ -328,68 +341,122 @@ CONSISTENCY_CASES = {
     "ไม่มี AH เลย": {
         "101": group((101, outcome(1.80)), (102, outcome(3.50)), (103, outcome(4.20))),
     },
+    "มีทั้งแฮนดิแคปและสูง/ต่ำ": {
+        "1058": group((1058, outcome(1.917, True, outcome_id="-1.75/home")),
+                      (1059, outcome(1.97, True, outcome_id="-1.75/away"))),
+        "1010": group((1010, outcome(1.55, False, outcome_id="2.5/over")),
+                      (1011, outcome(2.45, False, outcome_id="2.5/under"))),
+        "1012": group((1012, outcome(2.02, True, outcome_id="3.5/over")),
+                      (1013, outcome(1.83, True, outcome_id="3.5/under"))),
+    },
+    "สูง/ต่ำปักธงหลายเส้น": {
+        "1010": group((1010, outcome(1.95, True, outcome_id="2.5/over")),
+                      (1011, outcome(1.87, True, outcome_id="2.5/under"))),
+        "1012": group((1012, outcome(2.30, True, outcome_id="3.5/over")),
+                      (1013, outcome(1.62, True, outcome_id="3.5/under"))),
+    },
+    "สูง/ต่ำมีฝั่งเดียว": {
+        "1012": group((1012, outcome(2.02, True, outcome_id="3.5/over"))),
+    },
+    "มีแต่ตลาดประตูทีมเดียว": {
+        "1200": group((1200, outcome(1.90, True, outcome_id="home/1.5/over")),
+                      (1201, outcome(1.90, True, outcome_id="home/1.5/under"))),
+    },
 }
+
+# ชื่อตลาดที่รายงานใช้ คู่กับชื่อ field ใน JSON — เทสต์ sync ไล่ทีละคู่
+MARKET_LABELS = (("แฮนดิแคป", "handicap"), ("สูง/ต่ำ", "total"))
 
 
 class TestReportMatchesTheRealResult(unittest.TestCase):
     """
-    รายงานวินิจฉัยกับ field "handicap" ที่ส่งเข้า prompt ต้องมาจากการตัดสินใจครั้งเดียวกัน
+    รายงานวินิจฉัยกับ field ที่ส่งเข้า prompt ต้องมาจากการตัดสินใจครั้งเดียวกัน ทั้งสองตลาด
 
     เคยแยกกัน: รายงานดูแค่ธง mainLine ส่วน distill_book ดูทั้งการจับคู่และราคาด้วย
     ผลคือรายงานบอก "เจอเส้นหลักที่ 1058" แต่ JSON จริงกลับเป็น fallback เส้น 0.5
-    เทสต์กลุ่มนี้ล็อกไม่ให้สองฝั่งแยกกันได้อีก
+    เทสต์กลุ่มนี้ล็อกไม่ให้สองฝั่งแยกกันได้อีก และครอบทั้งแฮนดิแคปและสูง/ต่ำ
     """
 
     def distilled(self, markets):
         raw = {"pinnacle": book(markets)}
-        return odds_data.distill_odds(raw, CATALOG)["books"]["pinnacle"]["handicap"]
+        return odds_data.distill_odds(raw, CATALOG)["books"]["pinnacle"]
+
+    def scans(self, markets):
+        return {"handicap": odds_data.scan_handicap_lines(book(markets), CATALOG),
+                "total": odds_data.scan_total_lines(book(markets))}
+
+    def printed_summaries(self, markets):
+        """อ่านข้อความที่รายงานพิมพ์จริง แล้วคืน {ชื่อตลาด: บรรทัดสรุป}"""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            test_odds_offline.report_main_lines({"pinnacle": book(markets)}, CATALOG)
+
+        summaries, label = {}, None
+        for line in buffer.getvalue().splitlines():
+            for name, _ in MARKET_LABELS:
+                if line.strip().startswith(f"{name}:"):
+                    label = name
+            if "สรุป:" in line and label is not None:
+                summaries[label] = line.split("สรุป:")[1].strip()
+
+        return summaries
 
     def test_every_case_agrees_between_scan_and_json(self):
         for name, markets in CONSISTENCY_CASES.items():
-            with self.subTest(case=name):
-                scan = odds_data.scan_handicap_lines(book(markets), CATALOG)
-                handicap = self.distilled(markets)
+            scans, distilled = self.scans(markets), self.distilled(markets)
 
-                if scan["main"] is None:
-                    self.assertNotEqual(
-                        (handicap or {}).get("source"), "mainline",
-                        f"[{name}] สแกนไม่เจอเส้นหลัก แต่ JSON กลับบอกว่าใช้เส้นหลัก")
-                else:
-                    self.assertIsNotNone(handicap, f"[{name}] สแกนเจอเส้นหลัก แต่ JSON ว่างเปล่า")
-                    self.assertEqual(handicap["source"], "mainline")
-                    self.assertEqual(handicap["handicap"], scan["main"]["handicap"])
-                    self.assertEqual(handicap["market_ids"], scan["main"]["market_ids"])
+            for label, field in MARKET_LABELS:
+                with self.subTest(case=name, market=label):
+                    scan, chosen = scans[field], distilled[field]
+
+                    if scan["main"] is None:
+                        self.assertNotEqual(
+                            (chosen or {}).get("source"), "mainline",
+                            f"[{name}/{label}] สแกนไม่เจอเส้นหลัก แต่ JSON บอกว่าใช้เส้นหลัก")
+                    else:
+                        self.assertIsNotNone(chosen, f"[{name}/{label}] JSON ว่างเปล่า")
+                        self.assertEqual(chosen["source"], "mainline")
+                        self.assertEqual(chosen["line"], scan["main"]["line"])
+                        self.assertEqual(chosen["market_ids"], scan["main"]["market_ids"])
+
+    def test_the_verdict_in_the_json_matches_the_scan(self):
+        for name, markets in CONSISTENCY_CASES.items():
+            scans, distilled = self.scans(markets), self.distilled(markets)
+            for label, field in MARKET_LABELS:
+                with self.subTest(case=name, market=label):
+                    self.assertEqual(distilled[f"{field}_verdict"], scans[field]["verdict"])
 
     def test_printed_report_says_the_same_thing_as_the_json(self):
-        """อ่านข้อความที่รายงานพิมพ์จริง ๆ แล้วเทียบกับ JSON — กันไม่ให้ข้อความหลุดจากผล"""
+        """อ่านข้อความที่รายงานพิมพ์จริง ๆ แล้วเทียบกับ JSON — กันข้อความหลุดจากผล"""
         for name, markets in CONSISTENCY_CASES.items():
-            with self.subTest(case=name):
-                raw = {"pinnacle": book(markets)}
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    test_odds_offline.report_main_lines(raw, CATALOG)
+            summaries, distilled = self.printed_summaries(markets), self.distilled(markets)
 
-                summary = next(line.split("สรุป:")[1].strip()
-                               for line in buffer.getvalue().splitlines() if "สรุป:" in line)
-                handicap = self.distilled(markets)
-                uses_main_line = (handicap or {}).get("source") == "mainline"
+            for label, field in MARKET_LABELS:
+                with self.subTest(case=name, market=label):
+                    summary = summaries[label]
+                    chosen = distilled[field] or {}
 
-                if uses_main_line:
-                    self.assertIn(f"market {handicap['market_ids']['home']}", summary,
-                                  f"[{name}] รายงานกับ JSON ชี้คนละ market")
-                    self.assertIn("ใช้เส้นหลัก", summary)
-                else:
-                    self.assertIn("ไม่ใช้เส้นหลัก", summary,
-                                  f"[{name}] JSON ไม่ได้ใช้เส้นหลัก แต่รายงานบอกว่าใช้")
+                    if chosen.get("source") == "mainline":
+                        self.assertIn("ใช้เส้นหลัก", summary)
+                        for market_id in chosen["market_ids"].values():
+                            self.assertIn(market_id, summary,
+                                          f"[{name}/{label}] รายงานกับ JSON ชี้คนละ market")
+                    else:
+                        self.assertIn("ไม่ใช้เส้นหลัก", summary,
+                                      f"[{name}/{label}] JSON ไม่ได้ใช้เส้นหลัก แต่รายงานบอกว่าใช้")
 
     def test_the_report_reads_from_the_same_function_as_distill(self):
         """ไม่ใช่แค่ผลตรงกัน แต่ต้องเรียกฟังก์ชันตัดสินตัวเดียวกันจริง ๆ"""
-        raw = {"pinnacle": book(REAL_PINNACLE_MARKETS)}
-        from_report = test_odds_offline.main_line_conclusions(raw, CATALOG)["pinnacle"]["main"]
-        from_distill = odds_data.find_main_line(book(REAL_PINNACLE_MARKETS), CATALOG)
+        markets = dict(REAL_PINNACLE_MARKETS, **REAL_TOTAL_MARKETS)
+        from_report = test_odds_offline.main_line_conclusions({"pinnacle": book(markets)},
+                                                              CATALOG)["pinnacle"]
 
-        self.assertEqual(from_report, from_distill)
-        self.assertEqual(from_report["market_ids"]["home"], "1058")
+        self.assertEqual(from_report["handicap"]["main"],
+                         odds_data.find_main_line(book(markets), CATALOG))
+        self.assertEqual(from_report["total"]["main"],
+                         odds_data.scan_total_lines(book(markets))["main"])
+        self.assertEqual(from_report["handicap"]["main"]["market_ids"]["home"], "1058")
+        self.assertEqual(from_report["total"]["main"]["line"], 3.5)
 
     def test_a_flagged_line_with_a_missing_price_is_not_reported_as_used(self):
         """เคสที่เคยหลอกตา: รายงานเห็นธงเลยขึ้น mainLine แต่ระบบใช้ไม่ได้เพราะราคาขาด"""
@@ -400,10 +467,178 @@ class TestReportMatchesTheRealResult(unittest.TestCase):
         self.assertIsNone(scan["main"])
         self.assertTrue(any(row["flag"] for row in scan["outcomes"]),
                         "รายงานต้องยังโชว์ว่ามีธงอยู่ เพื่อให้เห็นว่าทำไมถึงใช้ไม่ได้")
-        self.assertEqual(self.distilled(markets)["source"], "fallback")
+        self.assertEqual(self.distilled(markets)["handicap"]["source"], "fallback")
+
+
+class TestTotalOutcomeIdParsing(unittest.TestCase):
+    """แกะเลขเส้นจาก bookmakerOutcomeId — และกันตลาดประตูทีมเดียวไม่ให้หลุดเข้ามา"""
+
+    def test_reads_the_line_and_the_side(self):
+        self.assertEqual(odds_data.parse_total_outcome_id("2.5/over"), (2.5, "over"))
+        self.assertEqual(odds_data.parse_total_outcome_id("3.5/under"), (3.5, "under"))
+        self.assertEqual(odds_data.parse_total_outcome_id("3/over"), (3.0, "over"))
+
+    def test_rejects_single_team_goal_markets(self):
+        """"home/1.5/over" คือประตูของทีมเดียว ไม่ใช่สกอร์รวม — หลุดเข้ามาแล้วเส้นจะผิด"""
+        for raw in ("home/1.5/over", "away/1.5/under", "home/2.5/over"):
+            self.assertIsNone(odds_data.parse_total_outcome_id(raw), f"{raw} ต้องไม่เข้าเกณฑ์")
+
+    def test_rejects_anything_that_is_not_a_full_match(self):
+        for raw in ("-1.75/home", "2.5/over/1st", "over", "2.5", "", None, "x/over"):
+            self.assertIsNone(odds_data.parse_total_outcome_id(raw))
+
+    def test_is_case_insensitive_on_the_side(self):
+        self.assertEqual(odds_data.parse_total_outcome_id("3.5/OVER"), (3.5, "over"))
+
+    def test_reads_the_id_from_the_same_dict_as_the_price(self):
+        entry = outcome(2.02, True, outcome_id="3.5/over")
+        self.assertEqual(odds_data.outcome_bookmaker_id(entry), "3.5/over")
+        self.assertEqual(odds_data.main_line_player(entry)["price"], 2.02)
+
+
+class TestRealTotalSample(unittest.TestCase):
+    """เคสหลักของสูง/ต่ำ: ข้อมูลจริงที่เส้น 2.5 ไม่ใช่เส้นหลัก ต้องได้ 3.5 ไม่ fallback"""
+
+    def test_finds_three_point_five_not_the_fixed_two_point_five(self):
+        scan = odds_data.scan_total_lines(book(REAL_TOTAL_MARKETS))
+
+        self.assertEqual(scan["verdict"], "mainline")
+        self.assertEqual(scan["main"]["line"], 3.5)
+        self.assertEqual(scan["main"]["over"], 2.02)
+        self.assertEqual(scan["main"]["under"], 1.83)
+        self.assertEqual(scan["main"]["market_ids"], {"over": "1012", "under": "1013"})
+
+    def test_needs_no_market_catalog_at_all(self):
+        """scan_total_lines ไม่รับ catalog เลย เลขเส้นมาจาก bookmakerOutcomeId ล้วน ๆ"""
+        raw = {"pinnacle": book(REAL_TOTAL_MARKETS)}
+        book_data = odds_data.distill_odds(raw, {})["books"]["pinnacle"]
+
+        self.assertEqual(book_data["total_verdict"], "mainline")
+        self.assertEqual(book_data["total"]["line"], 3.5)
+        self.assertEqual(book_data["total"]["source"], "mainline")
+
+    def test_single_team_goal_markets_never_reach_the_result(self):
+        markets = dict(REAL_TOTAL_MARKETS, **{
+            "1200": group((1200, outcome(1.90, True, outcome_id="home/1.5/over")),
+                          (1201, outcome(1.90, True, outcome_id="home/1.5/under"))),
+        })
+        scan = odds_data.scan_total_lines(book(markets))
+
+        self.assertEqual([row["market_id"] for row in scan["outcomes"]],
+                         ["1010", "1011", "1012", "1013"])
+        self.assertEqual(scan["main"]["line"], 3.5)
+
+    def test_reaches_the_prompt_with_thai_prices(self):
+        raw = {"pinnacle": book(REAL_TOTAL_MARKETS)}
+        summary = analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, CATALOG))
+
+        self.assertEqual(summary["total"]["line"], "3.5")
+        self.assertEqual(summary["total"]["source"], "mainline")
+        # 2.02 -> -0.98 และ 1.83 -> 0.83 ตามตรรกะแปลงราคาเดิมของแฮนดิแคป
+        self.assertEqual(summary["total"]["prices"], {"over": -0.98, "under": 0.83})
+
+
+class TestTotalFallback(unittest.TestCase):
+    """หา mainLine ของสูง/ต่ำไม่เจอ ต้องถอยไปเส้น 2.5 เดิม (fail-safe เดียวกับแฮนดิแคป)"""
+
+    def distilled(self, markets):
+        raw = {"pinnacle": book(markets)}
+        return odds_data.distill_odds(raw, CATALOG)["books"]["pinnacle"]
+
+    def test_no_flag_anywhere_falls_back_to_two_point_five(self):
+        book_data = self.distilled({
+            "1010": group((1010, outcome(1.95, outcome_id="2.5/over")),
+                          (1011, outcome(1.87, outcome_id="2.5/under"))),
+            "1012": group((1012, outcome(2.30, outcome_id="3.5/over")),
+                          (1013, outcome(1.62, outcome_id="3.5/under"))),
+        })
+
+        self.assertEqual(book_data["total_verdict"], "not_flagged")
+        self.assertEqual(book_data["total"]["source"], "fallback")
+        self.assertEqual(book_data["total"]["line"], 2.5)
+        self.assertEqual((book_data["total"]["over"], book_data["total"]["under"]), (1.95, 1.87))
+
+    def test_more_than_one_flagged_line_falls_back(self):
+        book_data = self.distilled({
+            "1010": group((1010, outcome(1.95, True, outcome_id="2.5/over")),
+                          (1011, outcome(1.87, True, outcome_id="2.5/under"))),
+            "1012": group((1012, outcome(2.30, True, outcome_id="3.5/over")),
+                          (1013, outcome(1.62, True, outcome_id="3.5/under"))),
+        })
+
+        self.assertEqual(book_data["total_verdict"], "ambiguous")
+        self.assertEqual(book_data["total"]["source"], "fallback")
+
+    def test_a_flagged_line_missing_a_price_falls_back(self):
+        book_data = self.distilled({
+            "1010": group((1010, outcome(1.95, False, outcome_id="2.5/over")),
+                          (1011, outcome(1.87, False, outcome_id="2.5/under"))),
+            "1012": group((1012, outcome(2.30, True, outcome_id="3.5/over")),
+                          (1013, outcome(None, True, outcome_id="3.5/under"))),
+        })
+
+        self.assertEqual(book_data["total_verdict"], "missing_price")
+        self.assertEqual(book_data["total"]["line"], 2.5)
+
+    def test_only_one_side_of_a_line_cannot_pair(self):
+        scan = odds_data.scan_total_lines(book({
+            "1012": group((1012, outcome(2.02, True, outcome_id="3.5/over"))),
+        }))
+
+        self.assertEqual(scan["verdict"], "no_pair")
+        self.assertIsNone(scan["main"])
+
+    def test_no_totals_market_at_all(self):
+        scan = odds_data.scan_total_lines(book({
+            "101": group((101, outcome(1.80)), (103, outcome(4.20))),
+        }))
+
+        self.assertEqual(scan["verdict"], "no_market")
+        self.assertIsNone(scan["main"])
+
+    def test_nothing_usable_leaves_the_field_empty(self):
+        book_data = self.distilled({"101": group((101, outcome(1.80)), (103, outcome(4.20)))})
+
+        self.assertIsNone(book_data["total"])
+        self.assertEqual(book_data["total_verdict"], "no_market")
+
+    def test_the_prompt_payload_is_empty_when_there_is_no_total(self):
+        raw = {"pinnacle": book({"101": group((101, outcome(1.80)), (103, outcome(4.20)))})}
+        summary = analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, CATALOG))
+
+        self.assertIsNone(summary["total"])
+
+
+class TestBothMarketsTogether(unittest.TestCase):
+    """แฮนดิแคปกับสูง/ต่ำต้องหากันคนละทาง ไม่รบกวนกัน"""
+
+    def setUp(self):
+        self.markets = dict(REAL_PINNACLE_MARKETS, **REAL_TOTAL_MARKETS)
+        raw = {"pinnacle": book(self.markets)}
+        self.book = odds_data.distill_odds(raw, CATALOG)["books"]["pinnacle"]
+
+    def test_each_market_finds_its_own_main_line(self):
+        self.assertEqual(self.book["handicap"]["handicap"], -1.75)
+        self.assertEqual(self.book["total"]["line"], 3.5)
+        self.assertEqual(self.book["handicap_verdict"], "mainline")
+        self.assertEqual(self.book["total_verdict"], "mainline")
+
+    def test_handicap_outcome_ids_do_not_leak_into_totals(self):
+        """"-1.75/home" ต้องไม่ถูกอ่านเป็นเส้นสูง/ต่ำ"""
+        lines = {row["line"] for row in odds_data.scan_total_lines(book(self.markets))["outcomes"]}
+        self.assertEqual(lines, {2.5, 3.5})
+
+    def test_both_reach_the_prompt(self):
+        raw = {"pinnacle": book(self.markets)}
+        summary = analyze.summarize_odds_for_prompt(odds_data.distill_odds(raw, CATALOG))
+
+        self.assertEqual(summary["handicap"]["line"], "1.75")
+        self.assertEqual(summary["total"]["line"], "3.5")
 
 
 class TestFallbackCatalogCoverage(unittest.TestCase):
+
+
     """สารบัญสำรองต้องครอบช่วงที่ยืนยันแล้ว และต้องไม่เดาเลยขอบออกไป"""
 
     def test_covers_every_confirmed_market_id(self):
@@ -656,7 +891,7 @@ class TestDistillWithMainLine(unittest.TestCase):
 
         self.assertIsNone(result["books"]["pinnacle"]["handicap"])
         self.assertTrue(any("ไม่มีเส้นแฮนดิแคป" in note for note in result["notes"]))
-        self.assertEqual(result["books"]["pinnacle"]["handicap_verdict"], "no_ah_market")
+        self.assertEqual(result["books"]["pinnacle"]["handicap_verdict"], "no_market")
 
 
 class TestHandicapLineLabel(unittest.TestCase):

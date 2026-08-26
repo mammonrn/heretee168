@@ -400,8 +400,11 @@ def decimal_to_hk(price):
     return round(-1 / (price - 1), 2)
 
 
-def convert_handicap(prices):
-    """แปลงราคาต่อรองทั้งฝั่งเหย้า-เยือนเป็นรูปแบบที่คนไทยอ่าน (ไม่แตะ 1x2)"""
+def convert_prices(prices):
+    """
+    แปลงราคาทั้งสองฝั่งเป็นรูปแบบที่คนไทยอ่าน — ใช้ทั้งแฮนดิแคป (home/away)
+    และสูง/ต่ำ (over/under) ด้วยตรรกะเดียวกันเป๊ะ ๆ (ไม่แตะ 1x2 ซึ่งยังเป็นทศนิยม)
+    """
     if not isinstance(prices, dict):
         return None
     return {side: decimal_to_hk(value) for side, value in prices.items()}
@@ -461,7 +464,7 @@ def summarize_handicap(book):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         value = None
 
-    prices = convert_handicap({"home": handicap.get("home"), "away": handicap.get("away")})
+    prices = convert_prices({"home": handicap.get("home"), "away": handicap.get("away")})
     if not prices or all(price is None for price in prices.values()):
         return None
 
@@ -471,6 +474,30 @@ def summarize_handicap(book):
         "giver": handicap_line_giver(value),
         "prices": prices,
         "source": handicap.get("source"),
+    }
+
+
+def summarize_total(book):
+    """
+    ย่อเส้นสูง/ต่ำที่จะเอาไปพูดให้เหลือเท่าที่ AI ต้องใช้ — ไม่มีเส้นที่ใช้ได้เลยคืน None
+
+    เลขเส้นมาจาก bookmakerOutcomeId ของเจ้ามือตรง ๆ (เช่น "3.5/over") ไม่ได้เดา
+    source บอกที่มาเหมือนฝั่งแฮนดิแคป: mainline = เส้นหลักที่ปักธงไว้,
+    fallback = เส้นตายตัว 2.5 ที่หยิบมาเพราะหาเส้นหลักไม่เจอ
+    """
+    total = book.get("total")
+    if not isinstance(total, dict):
+        return None
+
+    prices = convert_prices({"over": total.get("over"), "under": total.get("under")})
+    if not prices or all(price is None for price in prices.values()):
+        return None
+
+    line = total.get("line")
+    return {
+        "line": format_line_number(line) if isinstance(line, (int, float)) else None,
+        "prices": prices,
+        "source": total.get("source"),
     }
 
 
@@ -506,6 +533,7 @@ def summarize_odds_for_prompt(odds):
         "bookmaker": slug,
         "1x2": one_x_two,                       # ยังเป็นราคาทศนิยมตามเดิม
         "handicap": summarize_handicap(book),   # เส้นหลักเส้นเดียว ราคาแปลงเป็นแบบที่คนไทยอ่าน
+        "total": summarize_total(book),         # เส้นสูง/ต่ำหลัก แปลงราคาแบบเดียวกัน
         "handicap_price_format": "thai",
         "handicap_favourite": handicap_favourite(book),
         "market_favourite": favourite,

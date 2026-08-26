@@ -43,6 +43,7 @@ from odds_data import (
     is_simulated_fixture,
     SCAN_VERDICTS,
     scan_handicap_lines,
+    scan_total_lines,
 )
 from api_football import fail
 
@@ -129,16 +130,19 @@ def line_number(handicap):
 
 def main_line_conclusions(book_odds, catalog):
     """
-    ผลสแกนของทุกเจ้าในไฟล์ dump — {slug: ผลจาก scan_handicap_lines()}
-    ใช้ scan_handicap_lines ตัวเดียวกับที่ distill_book ใช้คำนวณ field "handicap"
-    รายงานกับผล JSON จึงมาจากการตัดสินใจครั้งเดียวกัน แยกกันไม่ได้อีกแล้ว
+    ผลสแกนของทุกเจ้าในไฟล์ dump — {slug: {"handicap": ผลสแกน, "total": ผลสแกน}}
+    ใช้ scan_handicap_lines / scan_total_lines ตัวเดียวกับที่ distill_book ใช้คำนวณ
+    field "handicap" กับ "total" รายงานกับผล JSON จึงมาจากการตัดสินใจครั้งเดียวกัน
     """
     conclusions = {}
 
     for wanted in PANEL_BOOKS:
         slug = book_slug(book_odds, wanted)
         if slug is not None:
-            conclusions[slug] = scan_handicap_lines(book_odds[slug], catalog)
+            conclusions[slug] = {
+                "handicap": scan_handicap_lines(book_odds[slug], catalog),
+                "total": scan_total_lines(book_odds[slug]),
+            }
 
     return conclusions
 
@@ -149,7 +153,7 @@ def report_main_lines(book_odds, catalog):
     ทุกบรรทัดมาจากผลของ scan_handicap_lines() ล้วน ๆ ไม่มีการไล่สแกนซ้ำในนี้เลย
     """
     print("-" * 70)
-    print("เส้นแฮนดิแคปที่แต่ละเจ้าเปิด ธง mainLine และเส้นที่ระบบเลือกใช้")
+    print("เส้นที่แต่ละเจ้าเปิด ธง mainLine และเส้นที่ระบบเลือกใช้ (แฮนดิแคป + สูง/ต่ำ)")
     print("-" * 70)
 
     conclusions = main_line_conclusions(book_odds, catalog)
@@ -160,27 +164,36 @@ def report_main_lines(book_odds, catalog):
             print(f"  {wanted:<12} ไม่มีเจ้านี้ในคู่นี้")
             continue
 
-        scan = conclusions[slug]
-        rows = scan["outcomes"]
-        print(f"  {slug:<12} AH markets ที่เจอ: {len(rows)}")
+        print(f"  {slug}")
+        report_scan(conclusions[slug]["handicap"], "แฮนดิแคป",
+                    lambda row: f"handicap {line_number(row['handicap'])}",
+                    lambda main: f"market {main['market_ids']['home']}"
+                                 f"/{main['market_ids']['away']}"
+                                 f" (เส้น {line_number(main['handicap'])})")
+        report_scan(conclusions[slug]["total"], "สูง/ต่ำ",
+                    lambda row: f"{row['side']} {row['line']:g}",
+                    lambda main: f"market {main['market_ids']['over']}"
+                                 f"/{main['market_ids']['under']} (เส้น {main['line']:g})")
 
-        for row in rows:
-            mark = {True: "  <== mainLine", False: "",
-                    None: "  (ไม่มีฟิลด์ mainLine)"}[row["flag"]]
-            price = row["price"] if row["price"] is not None else "ไม่มีราคา"
-            print(f"  {'':<12} market {row['market_id']}"
-                  f" handicap {line_number(row['handicap'])} ราคา {price}{mark}")
 
-        if not rows:
-            print(f"  {'':<12} ไม่มีเส้นแฮนดิแคปที่อยู่ในสารบัญเลย")
+def report_scan(scan, label, describe_row, describe_main):
+    """
+    พิมพ์ผลสแกนของตลาดหนึ่งตลาด — ทุกบรรทัดมาจาก scan ที่ส่งเข้ามาล้วน ๆ
+    ไม่มีการไล่ข้อมูลเองในนี้เลย รายงานจึงเล่าเรื่องเดียวกับ JSON เสมอ
+    """
+    rows = scan["outcomes"]
+    print(f"  {'':<4}{label}: เจอ {len(rows)} ช่อง")
 
-        main = scan["main"]
-        if main is not None:
-            print(f"  {'':<12} สรุป: ใช้เส้นหลัก market {main['market_ids']['home']}"
-                  f" (เส้น {line_number(main['handicap'])})")
-        else:
-            print(f"  {'':<12} สรุป: ไม่ใช้เส้นหลัก — {SCAN_VERDICTS[scan['verdict']]}"
-                  " (ถอยไปเส้นสำรอง)")
+    for row in rows:
+        mark = {True: "  <== mainLine", False: "", None: "  (ไม่มีฟิลด์ mainLine)"}[row["flag"]]
+        price = row["price"] if row["price"] is not None else "ไม่มีราคา"
+        print(f"  {'':<6} market {row['market_id']} {describe_row(row)} ราคา {price}{mark}")
+
+    if scan["main"] is not None:
+        print(f"  {'':<6} สรุป: ใช้เส้นหลัก {describe_main(scan['main'])}")
+    else:
+        print(f"  {'':<6} สรุป: ไม่ใช้เส้นหลัก — {SCAN_VERDICTS[scan['verdict']]}"
+              " (ถอยไปเส้นสำรอง)")
 
 
 def report_leagues():
@@ -252,7 +265,7 @@ def main():
     price_fields = ("home", "draw", "away", "over", "under")
     for book in result["books"].values():
         for market, prices in book.items():
-            if market == "handicap" or not isinstance(prices, dict):
+            if market in ("handicap", "total") or not isinstance(prices, dict):
                 continue  # ช่อง handicap มีข้อมูลประกอบปนอยู่ นับรวมแล้วตัวเลขจะเพี้ยน
             for field, value in prices.items():
                 if field in price_fields:
@@ -262,11 +275,12 @@ def main():
     print("=" * 70)
     print(f"อ่านราคาได้ {counter['มีราคา']} ช่อง / ว่าง {counter['ว่าง']} ช่อง")
 
-    sources = Counter((book.get("handicap") or {}).get("source", "ไม่มีเส้นเลย")
-                      for book in result["books"].values())
-    if sources:
-        print("ที่มาของเส้นแฮนดิแคปที่จะเอาไปพูด: "
-              + ", ".join(f"{name} {count} เจ้า" for name, count in sources.most_common()))
+    for label, field in (("แฮนดิแคป", "handicap"), ("สูง/ต่ำ", "total")):
+        sources = Counter((book.get(field) or {}).get("source", "ไม่มีเส้นเลย")
+                          for book in result["books"].values())
+        if sources:
+            print(f"ที่มาของเส้น{label}ที่จะเอาไปพูด: "
+                  + ", ".join(f"{name} {count} เจ้า" for name, count in sources.most_common()))
     if counter["มีราคา"] == 0:
         print("[!] ยังอ่านไม่ได้เลย — เปิดไฟล์ดูโครงสร้างใหม่ได้ทันทีโดยไม่ต้องยิง API ซ้ำ")
     print("ยิง API ไป 0 ครั้ง (อ่านจากไฟล์ล้วน)")
