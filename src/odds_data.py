@@ -65,12 +65,20 @@ STRIPPABLE_TOKENS = {
     "bk", "if", "club", "calcio", "futbol", "football", "de", "the",
 }
 
-# ถ้าฝั่งหนึ่งมีคำพวกนี้แต่อีกฝั่งไม่มี แปลว่าคนละทีม (ทีมหญิง/ทีมสำรอง/ทีมเยาวชน)
+# ถ้าฝั่งหนึ่งมีคำพวกนี้แต่อีกฝั่งไม่มี แปลว่าคนละทีม (ทีมหญิง/ทีมสำรอง/ทีมเยาวชน/ทีมจำลอง)
 DISQUALIFYING_TOKENS = {
     "women", "ladies", "w", "femenino", "feminine",
     "u17", "u18", "u19", "u20", "u21", "u23", "youth", "academy",
     "ii", "b", "reserves", "reserve",
+    # ทีมในลีกจำลอง (Simulated Reality League) ตั้งชื่อเลียนทีมจริง เช่น "Real Madrid SRL"
+    "srl", "esports", "efootball", "virtual", "cyber",
 }
+
+# ลีกจำลอง / eSports ที่ไม่ใช่การแข่งจริง — ตัดทิ้งตั้งแต่ต้นทาง ไม่เอาเข้ารายการที่ใช้จับคู่เลย
+# เหตุผล: ชื่อทีมเลียนของจริง ("Real Madrid SRL") ทำให้ชื่อทีมจริงดูกำกวมจนระบบไม่ยอมจับคู่
+SIMULATED_LEAGUE_TOKENS = {"srl", "esports", "efootball", "virtual", "cyber", "simulated"}
+SIMULATED_LEAGUE_PHRASES = ("simulated reality", "e-sports", "e sports", "virtual football",
+                            "cyber league", "gt leagues", "fifa esports")
 
 MIN_CONTAINMENT_LEN = 5  # ชื่อสั้นกว่านี้ห้ามใช้กติกา "เป็นส่วนหนึ่งของอีกชื่อ" (สั้นไปเสี่ยงชนกัน)
 
@@ -207,9 +215,10 @@ def fetch_oddspapi_fixtures(dates, api_key=None, counter=None):
 
     fixtures = as_list(payload, "fixtures")
     with_odds = [f for f in fixtures if isinstance(f, dict) and f.get("hasOdds")]
-    logger.info("OddsPapi: fixtures %d คู่ มีราคา %d คู่ (%s ถึง %s)",
-                len(fixtures), len(with_odds), dates[0], dates[-1])
-    return with_odds
+    real = drop_simulated(with_odds)
+    logger.info("OddsPapi: fixtures %d คู่ มีราคา %d คู่ ใช้จับคู่ได้ %d คู่ (%s ถึง %s)",
+                len(fixtures), len(with_odds), len(real), dates[0], dates[-1])
+    return real
 
 
 def dump_raw_odds(payload, fixture_id):
@@ -248,6 +257,44 @@ def fetch_odds(oddspapi_fixture_id, api_key=None, counter=None):
 
 
 # ---------- การจับคู่ fixture ----------
+
+
+def is_simulated_fixture(fixture):
+    """
+    คู่นี้มาจากลีกจำลอง/eSports หรือเปล่า — เช็คทั้งชื่อรายการ ชื่อประเทศ และชื่อทีม
+    ใช้การเทียบแบบคำ (token) สำหรับคำสั้นอย่าง srl กันไปโดนคำอื่นที่บังเอิญมีตัวอักษรเรียงกัน
+    """
+    if not isinstance(fixture, dict):
+        return False
+
+    fields = (fixture.get("tournamentName"), fixture.get("categoryName"),
+              fixture.get("participant1Name"), fixture.get("participant2Name"))
+
+    for value in fields:
+        text = normalize_name(value)
+        if not text:
+            continue
+        if SIMULATED_LEAGUE_TOKENS & set(text.split()):
+            return True
+        if any(phrase in text for phrase in SIMULATED_LEAGUE_PHRASES):
+            return True
+
+    return False
+
+
+def drop_simulated(fixtures):
+    """คัดคู่จากลีกจำลองออก แล้ว log ว่าตัดอะไรไปบ้าง (ไว้ตรวจว่ากรองโดนของจริงหรือเปล่า)"""
+    keep, dropped = [], []
+
+    for fixture in fixtures or []:
+        (dropped if is_simulated_fixture(fixture) else keep).append(fixture)
+
+    if dropped:
+        names = sorted({(f.get("tournamentName") or "?") for f in dropped})
+        logger.info("OddsPapi: ตัดคู่จากลีกจำลอง/eSports ทิ้ง %d คู่ (ลีก: %s)",
+                    len(dropped), ", ".join(names[:5]) + (" ..." if len(names) > 5 else ""))
+
+    return keep
 
 
 def normalize_name(name):
@@ -343,7 +390,9 @@ def match_fixture(oddspapi_fixtures, home_name, away_name, kickoff_iso=None, lea
     league_hint ใช้เป็นข้อมูลประกอบใน log เท่านั้น (ชื่อลีกสองเจ้าเรียกไม่เหมือนกัน
     จึงไม่เอามาเป็นเงื่อนไขตัดสิน)
     """
-    fixtures = [f for f in (oddspapi_fixtures or []) if isinstance(f, dict)]
+    # กันอีกชั้นเผื่อรายการที่ส่งเข้ามาไม่ได้ผ่าน fetch_oddspapi_fixtures (เช่น มาจากแคชเก่า)
+    fixtures = [f for f in (oddspapi_fixtures or [])
+                if isinstance(f, dict) and not is_simulated_fixture(f)]
     home_pool = [f.get("participant1Name") for f in fixtures]
     away_pool = [f.get("participant2Name") for f in fixtures]
 

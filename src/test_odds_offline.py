@@ -8,6 +8,8 @@
     ODDS_DEBUG_DUMP=1 python3 src/odds_data.py "Club Leon" "Real Salt Lake"   # เซฟไฟล์ครั้งเดียว
     python3 src/test_odds_offline.py                    # แล้วทดสอบซ้ำได้ไม่จำกัด
     python3 src/test_odds_offline.py path/to/other.json
+    python3 src/test_odds_offline.py --leagues          # ดูรายชื่อลีกจากรายการคู่ที่แคชไว้ใน cache.db
+                                                        # (ไว้ตรวจว่ามีลีกจำลอง/แปลก ๆ หลุดตัวกรองไหม)
 """
 
 import json
@@ -15,6 +17,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import cache_db
 from odds_data import (
     MARKET_1X2_AWAY,
     MARKET_1X2_DRAW,
@@ -28,6 +31,7 @@ from odds_data import (
     PANEL_BOOKS,
     build_market_index,
     distill_odds,
+    is_simulated_fixture,
 )
 from api_football import fail
 
@@ -82,7 +86,54 @@ def report_index(book_odds):
         print(f"  {'':<12} ที่เราใช้: {', '.join(available) if available else 'ไม่มีสักอัน'}")
 
 
+def report_leagues():
+    """
+    ไล่ดูรายการคู่ที่แคชไว้ใน cache.db แล้วสรุปว่ามีลีกอะไรบ้าง อันไหนถูกตัดเป็นลีกจำลอง
+    ใช้ตรวจว่าตัวกรองครอบคลุมพอหรือยัง โดยไม่ต้องยิง API ใหม่
+    """
+    cache_db.init_db()
+
+    with cache_db._connect() as conn:
+        rows = conn.execute(
+            "SELECT cache_key, payload FROM odds_cache WHERE cache_key LIKE 'oddspapi_fixtures:%'"
+        ).fetchall()
+
+    if not rows:
+        print("ยังไม่มีรายการคู่ในแคช — รัน analyze.py หนึ่งครั้งก่อน แล้วค่อยมาดูใหม่")
+        return
+
+    kept, dropped = Counter(), Counter()
+    for row in rows:
+        try:
+            fixtures = json.loads(row["payload"])
+        except ValueError:
+            continue
+        for fixture in fixtures:
+            name = f"{fixture.get('categoryName') or '?'} | {fixture.get('tournamentName') or '?'}"
+            (dropped if is_simulated_fixture(fixture) else kept)[name] += 1
+
+    print(f"อ่านจากแคช {len(rows)} ชุด")
+    print("-" * 70)
+    print(f"ลีกที่ถูกตัดว่าเป็นลีกจำลอง/eSports ({sum(dropped.values())} คู่)")
+    print("-" * 70)
+    for name, count in dropped.most_common():
+        print(f"  {count:>4}  {name}")
+    if not dropped:
+        print("  ไม่มีเลย")
+
+    print()
+    print("-" * 70)
+    print(f"ลีกที่เก็บไว้ใช้จับคู่ ({sum(kept.values())} คู่) — ไล่ดูว่ามีอันไหนดูไม่ใช่บอลจริงหลงเหลือไหม")
+    print("-" * 70)
+    for name, count in kept.most_common():
+        print(f"  {count:>4}  {name}")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--leagues":
+        report_leagues()
+        return
+
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DUMP
     book_odds, fixture_id = load_dump(path)
 
