@@ -82,6 +82,18 @@ SIMULATED_LEAGUE_PHRASES = ("simulated reality", "e-sports", "e sports", "virtua
 
 MIN_CONTAINMENT_LEN = 5  # ชื่อสั้นกว่านี้ห้ามใช้กติกา "เป็นส่วนหนึ่งของอีกชื่อ" (สั้นไปเสี่ยงชนกัน)
 
+# คำโดด ๆ ที่พบทั่วไปในชื่อสโมสรทั่วโลก ถ้า normalize แล้วเหลือแค่คำพวกนี้คำเดียว
+# ห้ามใช้กติกา containment เด็ดขาด — "athletic" คำเดียวไปเข้ากับ Dunfermline Athletic,
+# Forfar Athletic, Saint Patrick's Athletic ได้หมด (เจอจริงจนจับ Athletic Club ไม่ได้)
+GENERIC_SINGLE_TOKENS = {
+    "athletic", "atletico", "united", "city", "real", "sporting", "sport", "olympic",
+    "olympique", "dynamo", "dinamo", "rovers", "wanderers", "albion", "county", "town",
+    "rangers", "academy", "national", "central", "juniors", "stars", "eagles", "lions",
+}
+
+# ไฟล์ชื่อเรียกอื่นของทีมเดียวกัน (API-Football กับ OddsPapi เรียกไม่เหมือนกัน)
+TEAM_ALIASES_PATH = Path(__file__).resolve().parent.parent / "data" / "team_aliases.json"
+
 logger = logging.getLogger("heretee.odds")
 
 
@@ -297,18 +309,68 @@ def drop_simulated(fixtures):
     return keep
 
 
+_alias_cache = {"path": None, "map": None}
+
+
+def load_team_aliases(path=TEAM_ALIASES_PATH):
+    """
+    อ่าน data/team_aliases.json แล้วคืน dict: ชื่อที่ normalize แล้ว -> รหัสกลุ่ม
+    ทุกชื่อในกลุ่มเดียวกันได้รหัสเดียวกัน = ถือว่าเป็นทีมเดียวกัน
+    ไฟล์หาย / JSON เสีย -> คืน dict ว่าง (ระบบยังทำงานได้ แค่ไม่มี alias ช่วย)
+    """
+    if _alias_cache["path"] == str(path) and _alias_cache["map"] is not None:
+        return _alias_cache["map"]
+
+    mapping = {}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        groups = data.get("aliases", []) if isinstance(data, dict) else data
+
+        for index, group in enumerate(groups or []):
+            if not isinstance(group, list):
+                continue
+            for name in group:
+                normalized = normalize_name(name)
+                if normalized:
+                    mapping[normalized] = f"alias{index}"
+    except FileNotFoundError:
+        logger.info("ไม่พบไฟล์ alias ทีม: %s — ข้ามการใช้ alias", path)
+    except (OSError, ValueError) as exc:
+        logger.warning("อ่านไฟล์ alias ทีมไม่ได้ (%s) — ข้ามการใช้ alias", exc)
+
+    _alias_cache.update(path=str(path), map=mapping)
+    return mapping
+
+
+def alias_key(normalized_name):
+    """รหัสกลุ่ม alias ของชื่อนี้ (ถ้ามี) — ไม่มีคืน None"""
+    return load_team_aliases().get(normalized_name)
+
+
 def normalize_name(name):
     """
     ทำให้ชื่อทีมเทียบกันได้: ตัดเครื่องหมาย, เป็นตัวพิมพ์เล็ก, ตัดคำอย่าง FC/AC/CF ที่ไม่ได้แยกทีม
     เก็บคำอย่าง united/city ไว้เสมอ เพราะเป็นตัวแยกทีมจริง ๆ (ดูหมายเหตุที่ STRIPPABLE_TOKENS)
+    """
+    return normalize_details(name)[0]
+
+
+def normalize_details(name):
+    """
+    เหมือน normalize_name แต่บอกด้วยว่ามีการตัดคำทิ้งไปหรือเปล่า
+    คืน (ชื่อที่ normalize แล้ว, ตัดคำทิ้งไปไหม)
+
+    ที่ต้องรู้ว่า "ตัดไปไหม" เพราะชื่อที่เหลือคำเดียวเพราะโดนตัด (เช่น "Athletic Club" -> "athletic")
+    เชื่อถือไม่ได้พอจะเอาไป match แบบ containment (ดู name_score)
     """
     text = (name or "").lower()
     # ตัดจุด/อะพอสทรอฟีทิ้งก่อนโดยไม่แทนที่ด้วยช่องว่าง เพื่อให้ "A.C. Milan" -> "ac milan"
     # (ถ้าแทนด้วยช่องว่างจะได้ "a c milan" แล้ว "ac" จะไม่ถูกตัดออกตาม STRIPPABLE_TOKENS)
     text = re.sub(r"[.'’`]", "", text)
     cleaned = re.sub(r"[^\w\s]", " ", text)
-    tokens = [t for t in cleaned.split() if t not in STRIPPABLE_TOKENS]
-    return " ".join(tokens)
+    raw_tokens = cleaned.split()
+    tokens = [t for t in raw_tokens if t not in STRIPPABLE_TOKENS]
+    return " ".join(tokens), len(tokens) < len(raw_tokens)
 
 
 def name_tokens(name):
@@ -322,7 +384,8 @@ def name_score(a, b):
         1 = ชื่อหนึ่งเป็นส่วนหนึ่งของอีกชื่อ (Newcastle ⊂ Newcastle United)
         0 = ไม่เข้าเกณฑ์ / เป็นคนละทีมแน่ ๆ
     """
-    left, right = normalize_name(a), normalize_name(b)
+    left, left_reduced = normalize_details(a)
+    right, right_reduced = normalize_details(b)
     if not left or not right:
         return 0
 
@@ -336,11 +399,25 @@ def name_score(a, b):
     if left == right:
         return 2
 
-    shorter, longer = sorted((left, right), key=len)
-    if len(shorter) >= MIN_CONTAINMENT_LEN and shorter in longer:
-        return 1
+    # ชื่อเรียกอื่นของทีมเดียวกัน (เช่น Athletic Club = Athletic Bilbao) ถือว่าตรงกันเป๊ะ
+    left_alias, right_alias = alias_key(left), alias_key(right)
+    if left_alias and left_alias == right_alias:
+        return 2
 
-    return 0
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) < MIN_CONTAINMENT_LEN or shorter not in longer:
+        return 0
+
+    # ชื่อที่เหลือ "คำเดียว" ห้าม match แบบ containment ถ้า
+    #   (ก) มันเหลือคำเดียวเพราะโดนตัดคำอย่าง Club/FC ทิ้ง  หรือ
+    #   (ข) คำนั้นเป็นคำสามัญที่สโมสรทั่วโลกใช้กัน (athletic, united, city, ...)
+    # เคสแบบนี้ต้องตรงเป๊ะหรือมี alias เท่านั้น ("Athletic Club" ไม่ควรไปเข้ากับ Forfar Athletic)
+    for side, reduced in ((left, left_reduced), (right, right_reduced)):
+        tokens = side.split()
+        if len(tokens) == 1 and (reduced or tokens[0] in GENERIC_SINGLE_TOKENS):
+            return 0
+
+    return 1
 
 
 def is_ambiguous(name, candidate_names):

@@ -1,0 +1,40 @@
+{
+  "_readme": [
+    "ไฟล์นี้คือ 'ชื่อเรียกอื่นของทีมเดียวกัน' ใช้ตอนจับคู่ข้อมูลจาก API-Football กับ OddsPapi",
+    "สองเจ้านี้เรียกชื่อทีมไม่เหมือนกัน เช่น API-Football เรียก 'Athletic Club'",
+    "แต่ OddsPapi เรียก 'Athletic Bilbao' — ชื่อไม่มีคำร่วมกันเลยนอกจาก Athletic",
+    "ระบบเลยจับคู่ไม่ได้ ต้องบอกมันตรง ๆ ว่าสองชื่อนี้คือทีมเดียวกัน",
+    "",
+    "วิธีเพิ่มทีมใหม่ (ไม่ต้องเขียนโปรแกรมเป็นก็ทำได้):",
+    "1. ดู log ของบอทตอนจับคู่ไม่ได้ จะมีบรรทัดแบบ:",
+    "   OddsPapi: จับคู่ไม่ได้สำหรับ Barcelona vs Athletic Club",
+    "2. หาชื่อที่ OddsPapi ใช้เรียกทีมนั้น (ดูจากรายการคู่บอลที่มันส่งมา)",
+    "3. เพิ่มบรรทัดใหม่ในรายการ aliases ข้างล่าง เป็นลิสต์ของชื่อทั้งหมดที่หมายถึงทีมเดียวกัน",
+    "   ตัวอย่าง: [\"ชื่อที่ API-Football ใช้\", \"ชื่อที่ OddsPapi ใช้\", \"ชื่ออื่น ๆ ถ้ามี\"]",
+    "   อย่าลืมใส่เครื่องหมายคำพูด \"\" ครอบทุกชื่อ และลูกน้ำ , คั่นระหว่างบรรทัด",
+    "   บรรทัดสุดท้ายห้ามมีลูกน้ำต่อท้าย",
+    "4. บันทึกไฟล์ แล้วรีสตาร์ทบอท (pm2 restart heretee-bot)",
+    "",
+    "หมายเหตุ:",
+    "- ตัวพิมพ์เล็ก/ใหญ่ และคำอย่าง FC, AC, CF ไม่มีผล ระบบตัดให้เองอยู่แล้ว",
+    "- ใส่กี่ชื่อก็ได้ในหนึ่งกลุ่ม ทุกชื่อในกลุ่มเดียวกันจะถือว่าเป็นทีมเดียวกันหมด",
+    "- ไฟล์นี้แยกจาก popular_teams.json คนละหน้าที่กัน:",
+    "  ไฟล์นี้ = 'ชื่อไหนคือทีมเดียวกัน', popular_teams.json = 'ทีมไหนดังพอจะดันขึ้นก่อน'"
+  ],
+
+  "aliases": [
+    ["Athletic Club", "Athletic Bilbao", "Athletic de Bilbao"],
+
+    ["Bayern Munich", "Bayern München", "FC Bayern München", "Bayern Munchen"],
+    ["Paris Saint Germain", "Paris Saint-Germain", "PSG", "Paris SG"],
+    ["Tottenham", "Tottenham Hotspur", "Spurs"],
+    ["Wolves", "Wolverhampton", "Wolverhampton Wanderers"],
+    ["Manchester United", "Man United", "Man Utd"],
+    ["Manchester City", "Man City"],
+    ["Inter", "Internazionale", "Inter Milan"],
+    ["Sporting CP", "Sporting Lisbon", "Sporting Clube de Portugal"],
+    ["Urawa Reds", "Urawa Red Diamonds"],
+    ["Borussia Monchengladbach", "Borussia Mönchengladbach", "Monchengladbach", "Gladbach"],
+    ["Atletico Madrid", "Atlético Madrid", "Atletico de Madrid"]
+  ]
+}
