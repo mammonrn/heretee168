@@ -295,6 +295,45 @@ def fetch_odds_context(match_summary, log=lambda message: None):
         return None
 
 
+# ชื่อเส้นแฮนดิแคปภาษาไทย เรียงทีละ 0.25 (เลขคือจำนวนลูกที่ต่อ)
+# ตอนนี้ระบบดึงราคาจริงจาก market id ตายตัวแค่ 2 เส้นเท่านั้น คือ 0 กับ 0.5 (ดู MARKET_LINES)
+# ที่เหลือเก็บไว้เป็น reference เผื่ออนาคตเพิ่ม market id ใหม่ — เพิ่มต่อทีละ 0.25 ตามรูปแบบเดิม
+# หมายเหตุ: ตารางนี้เท่าที่มีข้อมูลตอนนี้ ยังไม่ใช่รายการที่สมบูรณ์ 100%
+HANDICAP_LINE_NAMES = {
+    "0": "ต่อเสมอ",
+    "0-0.5": "เสมอควบครึ่ง",
+    "0.5": "ครึ่งลูก",
+    "0.5-1": "ครึ่งควบลูก",
+    "1": "ลูกเดียว",
+    "1-1.5": "ลูกควบลูกครึ่ง",
+    "1.5": "ลูกครึ่ง",
+    "1.5-2": "ลูกครึ่งควบสอง",
+    "2": "สองลูก",
+    "2-2.5": "สองลูกควบสองลูกครึ่ง",
+}
+
+# ชื่อเรียกอื่นที่คนไทยใช้กับเส้นเดียวกัน
+HANDICAP_LINE_ALIASES = {
+    "0-0.5": ("ปป.",),
+}
+
+# เส้นที่ดึงราคาจริงได้ตอนนี้ ผูกกับ market id ใน odds_data.py
+#   ah_-0.5 = market 1068/1069 -> เส้น 0.5    ah_0 = market 1072/1073 -> เส้น 0
+MARKET_LINES = {"ah_-0.5": "0.5", "ah_0": "0"}
+
+
+def handicap_line_label(line):
+    """ชื่อเส้นพร้อมวงเล็บตัวเลขกำกับ เช่น "0.5" -> 'ครึ่งลูก [0.5]' (ไม่รู้จักเส้นนั้น -> None)"""
+    name = HANDICAP_LINE_NAMES.get(line)
+    return f"{name} [{line}]" if name else None
+
+
+def market_line_label(market):
+    """ชื่อเส้นของ market ที่ใช้จริง เช่น "ah_-0.5" -> 'ครึ่งลูก [0.5]'"""
+    line = MARKET_LINES.get(market)
+    return handicap_line_label(line) if line else None
+
+
 # ราคาต่อรองสองฝั่งที่ห่างกันน้อยกว่านี้ ถือว่าตลาดมองสูสี ไม่มีใครเป็นต่อชัด
 HANDICAP_LEVEL_GAP = 0.05
 
@@ -373,6 +412,7 @@ def summarize_odds_for_prompt(odds):
         "ah_-0.5": convert_handicap(book.get("ah_-0.5")),   # แปลงเป็นราคาที่คนไทยอ่าน
         "ah_0": convert_handicap(book.get("ah_0")),
         "handicap_price_format": "thai",
+        "handicap_lines": {market: market_line_label(market) for market in MARKET_LINES},
         "handicap_favourite": handicap_favourite(book),
         "market_favourite": favourite,
         "total_books": odds.get("total_books"),
