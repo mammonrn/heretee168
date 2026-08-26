@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-from analyze import analyze_fixture, filter_popular_matches
+from analyze import analyze_fixture, sort_matches_by_popularity
 from api_football import fail, get_api_key
 from fetch_fixtures import (
     date_range,
@@ -75,10 +75,6 @@ GREETING = (
 PICK_DAY = "เลือกวันที่ต้องการดูโปรแกรมครับ 👇"
 PICK_LEAGUE = "เลือกลีกครับ 👇"
 PICK_MATCH = "เลือกคู่ที่อยากให้เฮียตี๋วิเคราะห์ครับ 👇"
-NO_POPULAR_MATCHES = (
-    "ลีกนี้วันนี้มีแต่คู่เล็ก ๆ ที่คนไม่ค่อยตามครับ เฮียเลยไม่เอามาให้เลือก 🙏\n"
-    "ลองดูลีกอื่นหรือวันอื่นได้เลย"
-)
 ANALYZING = "🔍 เฮียตี๋กำลังดูเกมนี้ให้ รอแป๊บ..."
 ERROR_MESSAGE = "ขออภัยครับ เฮียตี๋ดูเกมนี้ไม่ได้ตอนนี้ ลองใหม่อีกครั้ง 🙏"
 ONLY_BUTTONS = "กดเมนูด้านล่างเพื่อดูบทวิเคราะห์จากเฮียตี๋ได้เลยครับ 👇"
@@ -470,21 +466,18 @@ async def league_handler(update, context):
 
     header = f"{league['name_th']} — {day_label(date_str, snapshot['dates'])}"
 
-    # กรองด้วยรายชื่อทีมดังในเครื่อง (data/popular_teams.json) — ไม่ยิง API จึงตอบได้ทันที
-    popular, stats = filter_popular_matches(matches, date_str, league.get("name_en"), logger.info)
+    # เรียงคู่ที่มีทีมดังขึ้นก่อนด้วยรายชื่อในเครื่อง (data/popular_teams.json)
+    # ไม่ยิง API จึงตอบได้ทันที และไม่ซ่อนคู่ไหน จำนวนคู่จึงตรงกับที่โชว์ในเมนูเลือกลีก
+    ordered, stats = sort_matches_by_popularity(matches, date_str, league.get("name_en"), logger.info)
 
-    logger.info("ลีก %s วัน %s: แสดง %d จาก %d คู่ (ซ่อน %d, fallback=%s)",
-                league.get("name_en"), date_str, len(popular), stats["total"],
-                stats["hidden"], stats["fallback"])
-
-    if not popular:
-        await safe_edit(query, f"{header}\n{NO_POPULAR_MATCHES}", home_keyboard())
-        return
+    logger.info("ลีก %s วัน %s: %d คู่ (ทีมดัง %d, อื่น ๆ %d, fallback=%s)",
+                league.get("name_en"), date_str, stats["total"],
+                stats["popular"], stats["others"], stats["fallback"])
 
     await safe_edit(
         query,
         f"{header}\n{PICK_MATCH}",
-        match_keyboard(snapshot, date_str, league_id, matches=popular),
+        match_keyboard(snapshot, date_str, league_id, matches=ordered),
     )
 
 

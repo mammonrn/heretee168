@@ -55,9 +55,10 @@ ODDSPAPI_FIXTURE_FIELDS = ("fixtureId", "participant1Name", "participant2Name",
 # เจ้าที่ยกมาให้ AI ดูเป็นหลัก (เจ้าคมราคา) — ไม่ต้องยัดราคาทุกเจ้าเข้า prompt
 SHARP_BOOK_FOR_PROMPT = "pinnacle"
 
-# ---- การกรองคู่บอลตามความนิยม ----
+# ---- การจัดลำดับคู่บอลตามความนิยม ----
 # ใช้ "รายชื่อทีมดัง" ที่เราคัดไว้เอง (data/popular_teams.json) ไม่ยิง API ใด ๆ ทั้งสิ้น
-# เดิมเคยเช็คจากจำนวนเจ้ามือของ OddsPapi แต่กินโควตาเร็วเกินไป (~11-20 requests ต่อการกดลีกครั้งเดียว)
+# ไม่ซ่อนคู่ไหนทั้งนั้น — แค่ดันคู่ที่มีทีมดังขึ้นก่อน คู่ที่เหลือต่อท้าย
+# (เดิมเคยเช็คจากจำนวนเจ้ามือของ OddsPapi แต่กินโควตาเร็วเกินไป ~11-20 requests ต่อการกดลีกครั้งเดียว)
 POPULAR_TEAMS_PATH = Path(__file__).resolve().parent.parent / "data" / "popular_teams.json"
 
 USER_INSTRUCTION = (
@@ -380,19 +381,22 @@ def is_popular_team(team_name, popular_names):
     return normalize_name(team_name) in popular_names
 
 
-def filter_popular_matches(matches, date_str=None, league_hint=None, log=lambda message: None,
-                           popular_names=None):
+def sort_matches_by_popularity(matches, date_str=None, league_hint=None, log=lambda message: None,
+                               popular_names=None):
     """
-    คัดเฉพาะคู่ที่มีทีมดังอย่างน้อยหนึ่งทีม — ใช้รายชื่อที่คัดไว้เอง ไม่ยิง API ใด ๆ เลย
+    จัดลำดับคู่บอล: คู่ที่มีทีมดัง (อย่างน้อยหนึ่งฝั่ง) ขึ้นก่อน คู่ที่เหลือต่อท้าย
+    **ไม่ซ่อนคู่ไหนทั้งสิ้น** — จำนวนคู่ที่คืนออกไปเท่ากับที่รับเข้ามาเสมอ
+    (เมนูเลือกลีกจึงแสดงจำนวนคู่ได้ตรงกับที่เห็นจริงในหน้าถัดไป)
 
     matches เป็น list ของ (เวลาเตะ, ทีมเหย้า, ทีมเยือน, fixture_id) ตามที่ fetch_fixtures จัดมา
-    คืน (คู่ที่เหลือ, สถิติ) — สถิติมี total/kept/hidden/fallback ไว้ log และเทสต์
+    คืน (คู่ที่เรียงแล้ว, สถิติ) — สถิติมี total/popular/others/fallback ไว้ log และเทสต์
+    ลำดับเดิมภายในแต่ละกลุ่มถูกรักษาไว้ (คู่มาเรียงตามเวลาเตะอยู่แล้ว)
 
-    fail-open: ถ้าโหลดรายชื่อไม่ได้เลย จะคืนคู่ทั้งหมด (โชว์เกินดีกว่าโชว์หน้าว่าง)
-    date_str / league_hint ไม่ได้ใช้ตัดสินแล้ว เก็บไว้เพื่อความเข้ากันได้กับผู้เรียกเดิมและใช้ใน log
+    ไม่ยิง API ใด ๆ — อ่านจาก data/popular_teams.json อย่างเดียว
+    date_str / league_hint ไม่ได้ใช้ตัดสิน เก็บไว้เพื่อความเข้ากันได้กับผู้เรียกเดิมและใช้ใน log
     """
     matches = list(matches or [])
-    stats = {"total": len(matches), "kept": 0, "hidden": 0, "fallback": False}
+    stats = {"total": len(matches), "popular": 0, "others": 0, "fallback": False}
 
     if not matches:
         return [], stats
@@ -400,27 +404,25 @@ def filter_popular_matches(matches, date_str=None, league_hint=None, log=lambda 
     names = load_popular_teams(log=log) if popular_names is None else popular_names
 
     if not names:
-        stats.update(fallback=True, kept=len(matches))
-        log(f"ไม่มีรายชื่อทีมดังให้ใช้ — แสดงทุกคู่ตามเดิม ({len(matches)} คู่)")
+        stats.update(fallback=True, others=len(matches))
+        log(f"ไม่มีรายชื่อทีมดังให้ใช้ — คงลำดับเดิมทั้งหมด ({len(matches)} คู่)")
         return matches, stats
 
-    kept = []
+    popular, others = [], []
     for match in matches:
         _, home, away, _ = match
-
         if is_popular_team(home, names) or is_popular_team(away, names):
-            kept.append(match)
-            stats["kept"] += 1
+            popular.append(match)
         else:
-            stats["hidden"] += 1
-            # พิมพ์ชื่อเต็มไว้ให้ก๊อปไปเติมใน data/popular_teams.json ได้ทันทีถ้าอยากให้โชว์
-            log(f"ซ่อน: {home} vs {away} (ไม่มีทีมดังในคู่นี้)")
+            others.append(match)
 
-    log(f"กรองด้วยรายชื่อทีมดัง (ไม่ได้ยิง OddsPapi): แสดง {len(kept)} คู่"
-        f" จากทั้งหมด {stats['total']} คู่ (ซ่อน {stats['hidden']})"
+    stats.update(popular=len(popular), others=len(others))
+
+    log(f"เรียงตามรายชื่อทีมดัง (ไม่ได้ยิง OddsPapi): คู่ที่มีทีมดัง {stats['popular']} คู่ขึ้นก่อน"
+        f" ตามด้วยอีก {stats['others']} คู่ (รวม {stats['total']} คู่ ไม่ได้ซ่อนคู่ไหน)"
         f"{' | ลีก ' + league_hint if league_hint else ''}")
 
-    return kept, stats
+    return popular + others, stats
 
 
 def analyze_fixture(fixture_id, fresh=False, log=lambda message: None):
